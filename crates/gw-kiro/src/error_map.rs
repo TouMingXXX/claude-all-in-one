@@ -68,6 +68,23 @@ fn is_model_overloaded(body: &str) -> bool {
     b.contains("MODEL_TEMPORARILY_UNAVAILABLE")
 }
 
+/// 400 响应体的 `reason` 若是上游媒体硬限制,返回给客户的**我方**提示语(不含上游原文)。
+///
+/// 正常情况下 `converter::media_limits` 出站前已把这些限制预检掉,走到这里说明上游改了
+/// 限制或预检有漏;至少让客户知道是附件的问题、该怎么办,而不是一句「请求无效」。
+/// 2026-09-29 那例就是:151 张图撞 100 张上限,客户只看到「请求无效,请检查请求体后重试」。
+fn media_limit_hint(body: &str) -> Option<&'static str> {
+    let reason = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    Some(match reason.get("reason")?.as_str()? {
+        "IMAGE_COUNT_EXCEEDED" => "对话中的图片/文档总数超出单次请求上限(100 个)。请新开会话,或回退到更早的位置后重试",
+        "IMAGE_SIZE_EXCEEDED" => "有图片超出单张 5MB 的上限。请压缩或缩小图片后重试",
+        "IMAGE_DIMENSION_EXCEEDED" => "有图片边长超出 8000 像素的上限。请缩小或裁剪图片后重试",
+        "DOCUMENT_SIZE_EXCEEDED" => "有文档超出单个 4.5MB 的上限。请拆分文件或分页读取后重试",
+        "DOCUMENT_COUNT_EXCEEDED" => "单条消息最多附带 5 个文档。请分成几条消息发送",
+        _ => return None,
+    })
+}
+
 /// 把 generateAssistantResponse 的失败响应分类。
 ///
 /// `status` = HTTP 状态码,`body` = 响应体文本(可空)。
@@ -81,6 +98,9 @@ pub fn classify_chat_error(status: u16, body: &str) -> UpstreamError {
         //   如 eu-central-1 号点 claude-sonnet-5)→ ModelNotAvailable:**不惩罚账号**
         //   (否则计失败刷禁健康号)+ 换号到有该模型的号(见 gw_core::UpstreamErrorKind)。
         400 if is_invalid_model_id(body) => UpstreamErrorKind::ModelNotAvailable,
+        // 400 + 已知媒体限制 reason:结构化判据优先于下面按正文关键词的模糊匹配(正文里
+        // 恰好同时出现 invalid/model 也不能被当成瞬时错误去换号)。
+        400 if media_limit_hint(body).is_some() => UpstreamErrorKind::BadRequest,
         // 其余"invalid model"文案(无 INVALID_MODEL_ID):当瞬时故障可重试(ServerError)。
         400 if is_transient_invalid_model(body) => UpstreamErrorKind::ServerError,
         400 => UpstreamErrorKind::BadRequest,
@@ -98,8 +118,14 @@ pub fn classify_chat_error(status: u16, body: &str) -> UpstreamError {
         500..=599 => UpstreamErrorKind::ServerError,
         _ => UpstreamErrorKind::Other,
     };
-    UpstreamError::new(kind, format!("kiro generateAssistantResponse 失败: {status} {body}"))
-        .with_status(status)
+    let message = format!("kiro generateAssistantResponse 失败: {status} {body}");
+    let err = match media_limit_hint(body) {
+        Some(hint) if kind == UpstreamErrorKind::BadRequest => {
+            UpstreamError::bad_request_with_hint(message, hint)
+        }
+        _ => UpstreamError::new(kind, message),
+    };
+    err.with_status(status)
 }
 
 #[cfg(test)]
@@ -205,6 +231,46 @@ mod tests {
     #[test]
     fn status_preserved() {
         assert_eq!(classify_chat_error(429, "x").status_code, Some(429));
+    }
+
+    #[test]
+    fn media_limit_400_gets_actionable_hint_without_upstream_text() {
+        let body = r#"{"message":"too many inline media segments: 151 exceeds limit 100","reason":"IMAGE_COUNT_EXCEEDED"}"#;
+        let e = classify_chat_error(400, body);
+        assert_eq!(e.kind, UpstreamErrorKind::BadRequest, "仍是内容级错误:不换号、不惩罚账号");
+        assert_eq!(e.status_code, Some(400));
+        let out = e.client_message();
+        assert!(out.contains("图片/文档总数") && out.contains("100"), "{out}");
+        assert!(!out.contains("inline media") && !out.contains("IMAGE_COUNT_EXCEEDED"), "不外传上游原文: {out}");
+        assert!(e.message.contains(body), "内部诊断留原文");
+    }
+
+    /// 提示语里写死的数字必须和预检常量一致,改了一边忘了另一边这里会红。
+    #[test]
+    fn media_limit_hints_match_precheck_constants() {
+        use crate::converter::media_limits as ml;
+        let hint = |reason: &str| media_limit_hint(&format!(r#"{{"reason":"{reason}"}}"#)).unwrap();
+        assert!(hint("IMAGE_COUNT_EXCEEDED").contains(&format!("{} 个", ml::MAX_MEDIA_PER_REQUEST)));
+        assert_eq!(ml::MAX_IMAGE_BASE64_BYTES, 5 * 1024 * 1024);
+        assert!(hint("IMAGE_DIMENSION_EXCEEDED").contains(&format!("{} 像素", ml::MAX_IMAGE_SIDE_PX)));
+        assert_eq!(ml::MAX_DOCUMENT_RAW_BYTES, 4_500_000);
+        assert!(hint("DOCUMENT_COUNT_EXCEEDED").contains(&format!("{} 个文档", ml::MAX_DOCUMENTS_PER_MESSAGE)));
+    }
+
+    #[test]
+    fn media_reason_beats_fuzzy_invalid_model_match() {
+        let body = r#"{"reason":"IMAGE_COUNT_EXCEEDED","message":"Invalid request for model: too many inline media segments"}"#;
+        let e = classify_chat_error(400, body);
+        assert_eq!(e.kind, UpstreamErrorKind::BadRequest, "不能被当成瞬时 invalid model 去换号");
+        assert!(e.client_message().contains("图片/文档总数"));
+    }
+
+    #[test]
+    fn unknown_or_non_json_400_keeps_neutral_message() {
+        for body in ["Improperly formed request.", r#"{"reason":"SOMETHING_NEW"}"#, r#"{"reason":null}"#] {
+            let e = classify_chat_error(400, body);
+            assert_eq!(e.client_message(), UpstreamErrorKind::BadRequest.client_message(), "{body}");
+        }
     }
 
     /// 分类结果的**对外**文案绝不带上游身份 —— `message` 里那串

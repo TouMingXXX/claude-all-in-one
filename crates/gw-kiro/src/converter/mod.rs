@@ -20,7 +20,7 @@ mod classifier_prompt;
 mod content;
 mod document_name;
 mod history;
-mod media_limits;
+pub(crate) mod media_limits;
 mod model_map;
 mod normalize;
 mod pairing;

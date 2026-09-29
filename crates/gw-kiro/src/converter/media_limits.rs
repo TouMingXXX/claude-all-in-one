@@ -1,4 +1,4 @@
-//! 上游逐项媒体硬限制预检:单文档 / 单图 / 每条文档数。
+//! 上游媒体硬限制预检:逐项(单文档 / 单图 / 每条文档数)+ 单请求媒体总数。
 //!
 //! 【实测定标 2026-09-29,claude-opus-5.5,绕开 caio 自身闸门直打上游】
 //! | 限制 | 实测 | 上游 400 reason |
@@ -8,6 +8,11 @@
 //! | 单图 base64 长度 | 5,242,880 字节("image exceeds 5 MB maximum") | IMAGE_SIZE_EXCEEDED |
 //! | 图片边长 | 8000px 过、8200px 拒 | IMAGE_DIMENSION_EXCEEDED |
 //! | 跨轮文档总数 | history 里 6 个(每轮 1 个)照常可读 | —— 只按单条消息计 |
+//! | 单请求媒体总数 | 线上 151 个被拒("too many inline media segments: 151 exceeds limit 100") | IMAGE_COUNT_EXCEEDED |
+//!
+//! 单请求总数是 2026-09-29 线上撞出来的:Claude Desktop 的 Claude in Chrome 每步截图都以
+//! tool_result 图片进历史,1262 条消息的会话攒到 151 张,此后每轮 400。按请求计(history +
+//! current 合计),不是按条;文档是否计入未单独实测,保守一并计入。
 //!
 //! 这些是**逐项**规则:一个超限附件会让整轮 400;客户端每轮重发整段历史,超限附件一直在里面,
 //! 于是此后每轮都 400 —— 用户只能新开会话。这里改成只剔那一个附件,原位留一句模型可读的说明
@@ -27,6 +32,10 @@ pub const MAX_DOCUMENTS_PER_MESSAGE: usize = 5;
 pub const MAX_IMAGE_BASE64_BYTES: usize = 5 * 1024 * 1024;
 /// 图片任一边的像素上限。
 pub const MAX_IMAGE_SIDE_PX: u32 = 8000;
+/// 单次请求(history + current)可携带的图片 + 文档总数上限。
+pub const MAX_MEDIA_PER_REQUEST: usize = 100;
+/// 总数超限时,历史媒体按此步长整批剔除(见 [`enforce_request_media_count`])。
+const MEDIA_COUNT_SHED_STEP: usize = 20;
 
 /// 宽松解码 base64 的前 `max_chars` 个有效字符:跳过空白、兼容 URL-safe 字母表(`-`/`_`)、
 /// 忽略 padding。截在编码组中间时丢掉不完整的尾组。解码失败返回 `None`。
@@ -132,6 +141,8 @@ fn image_dimensions(b64: &str) -> Option<(u32, u32)> {
 pub struct MediaLimitReport {
     pub dropped_documents: usize,
     pub dropped_images: usize,
+    /// 因单请求总数超限而剔除的媒体数(图片 + 文档)。
+    pub over_count_dropped: usize,
 }
 
 /// base64 长度 → 原始字节数(按标准 padding 估算,误差 ≤2 字节)。
@@ -142,6 +153,14 @@ fn decoded_len(b64: &str) -> usize {
 
 fn mb(bytes: usize) -> f64 {
     bytes as f64 / 1_000_000.0
+}
+
+/// 往该轮 content 末尾追加一行说明(非空时先换行)。
+fn append_note(content: &mut String, note: &str) {
+    if !content.is_empty() {
+        content.push('\n');
+    }
+    content.push_str(note);
 }
 
 /// 对一条消息的 content/images/documents 就地套用逐项上限,超限项换成说明文字。
@@ -203,14 +222,82 @@ fn enforce(
     report.dropped_documents += notes.iter().filter(|n| n.starts_with("[document")).count();
     report.dropped_images += notes.iter().filter(|n| n.starts_with("[image")).count();
     for n in notes {
-        if !content.is_empty() {
-            content.push('\n');
-        }
-        content.push_str(&n);
+        append_note(content, &n);
     }
 }
 
-/// 当前轮 + 全部历史 user 轮套用逐项上限。无超限项时零改动(不触碰缓存前缀字节)。
+/// 从一条消息**最前面**剔 `n` 个媒体(同轮文档优先,与体积护栏 `shed` 同序),留一句说明。
+/// 返回实际剔除数(≤ n)。
+fn drop_front_media(
+    content: &mut String,
+    images: &mut Vec<KiroImage>,
+    documents: &mut Vec<KiroDocument>,
+    n: usize,
+) -> usize {
+    let docs = n.min(documents.len());
+    documents.drain(..docs);
+    let imgs = (n - docs).min(images.len());
+    images.drain(..imgs);
+    let dropped = docs + imgs;
+    if dropped > 0 {
+        // 说明里只放本轮剔除数,不放请求总数:总数每轮都变,写进去会让这段前缀每轮变字节。
+        append_note(
+            content,
+            &format!(
+                "[{dropped} attachment(s) omitted: at most {MAX_MEDIA_PER_REQUEST} images/documents \
+                 can be sent in one request, so the oldest ones were removed]"
+            ),
+        );
+    }
+    dropped
+}
+
+/// 单请求媒体总数超限时,从**最老**的历史媒体剔起;返回剔除数(未超限返回 0、零改动)。
+///
+/// 剔除数按 [`MEDIA_COUNT_SHED_STEP`] 向上取整,而不是刚好压到上限:截图型会话每轮都新增
+/// 图片,若刚好压到上限,每多一张图剔除边界就后移一张;而最老的被剔媒体在会话很靠前的位置,
+/// 前缀从那里起每轮都变,上游前缀缓存每轮全失效。按步长剔,边界每 20 张新图才移动一次。
+/// 代价是最多多剔 19 张最老的媒体 —— 它们早已被之前的回合消化过。
+///
+/// 历史剔光仍超(当前轮自己就带了超过上限的媒体)时,再从当前轮最前面剔到刚好等于上限。
+fn enforce_request_media_count(current: &mut UserInputMessage, history: &mut [Message]) -> usize {
+    let history_total: usize = history
+        .iter()
+        .filter_map(|m| match m {
+            Message::User(u) => {
+                Some(u.user_input_message.images.len() + u.user_input_message.documents.len())
+            }
+            _ => None,
+        })
+        .sum();
+    let total = history_total + current.images.len() + current.documents.len();
+    if total <= MAX_MEDIA_PER_REQUEST {
+        return 0;
+    }
+    let excess = total - MAX_MEDIA_PER_REQUEST;
+    let from_history =
+        (excess.div_ceil(MEDIA_COUNT_SHED_STEP) * MEDIA_COUNT_SHED_STEP).min(history_total);
+    let mut left = from_history;
+    for msg in history.iter_mut() {
+        if left == 0 {
+            break;
+        }
+        if let Message::User(u) = msg {
+            let m = &mut u.user_input_message;
+            left -= drop_front_media(&mut m.content, &mut m.images, &mut m.documents, left);
+        }
+    }
+    let from_current = excess.saturating_sub(from_history);
+    let dropped_current = drop_front_media(
+        &mut current.content,
+        &mut current.images,
+        &mut current.documents,
+        from_current,
+    );
+    from_history + dropped_current
+}
+
+/// 当前轮 + 全部历史 user 轮套用逐项上限与单请求总数上限。无超限项时零改动(不触碰缓存前缀字节)。
 pub fn enforce_media_limits(current: &mut UserInputMessage, history: &mut [Message]) -> MediaLimitReport {
     let mut report = MediaLimitReport::default();
     for msg in history.iter_mut() {
@@ -220,11 +307,21 @@ pub fn enforce_media_limits(current: &mut UserInputMessage, history: &mut [Messa
         }
     }
     enforce(&mut current.content, &mut current.images, &mut current.documents, &mut report);
-    if report != MediaLimitReport::default() {
+    if report.dropped_documents + report.dropped_images > 0 {
         tracing::warn!(
             dropped_documents = report.dropped_documents,
             dropped_images = report.dropped_images,
             "媒体超出上游逐项上限(单文档 4.5MB / 每条 5 个文档 / 单图 5MB / 边长 8000px)，已剔除并留说明"
+        );
+    }
+    // 总数放在逐项之后:逐项剔掉的不再占名额。
+    report.over_count_dropped = enforce_request_media_count(current, history);
+    if report.over_count_dropped > 0 {
+        tracing::warn!(
+            dropped = report.over_count_dropped,
+            limit = MAX_MEDIA_PER_REQUEST,
+            step = MEDIA_COUNT_SHED_STEP,
+            "单请求图片/文档总数超出上游上限，已从最老处按步长剔除并留说明"
         );
     }
     report
@@ -233,7 +330,7 @@ pub fn enforce_media_limits(current: &mut UserInputMessage, history: &mut [Messa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kiro_types::conversation::{HistoryUserMessage, UserMessage};
+    use crate::kiro_types::conversation::{HistoryAssistantMessage, HistoryUserMessage, UserMessage};
 
     fn b64_of_raw(raw: usize) -> String {
         "A".repeat(raw.div_ceil(3) * 4)
@@ -405,6 +502,147 @@ mod tests {
         assert_eq!(u1.user_input_message.content, "fine", "未超限的轮次字节不应变");
         assert_eq!(u1.user_input_message.documents.len(), 1);
         assert_eq!(cur.content, "look");
+    }
+
+    fn tiny_img() -> KiroImage {
+        // 头读不出尺寸 → 逐项预检放行,只占总数名额。
+        KiroImage::from_base64("png", "B".repeat(8))
+    }
+
+    /// 每个元素一轮 user(带 n 张图),轮间夹 assistant —— 截图型会话的形状。
+    fn history_with_images(per_turn: &[usize]) -> Vec<Message> {
+        let mut out = Vec::new();
+        for (i, n) in per_turn.iter().enumerate() {
+            let mut u = UserMessage::new(format!("turn{i}"), "claude-opus-5.5");
+            u.images = (0..*n).map(|_| tiny_img()).collect();
+            out.push(Message::User(HistoryUserMessage { user_input_message: u }));
+            out.push(Message::Assistant(HistoryAssistantMessage::new("ok")));
+        }
+        out
+    }
+
+    fn user_turns(history: &[Message]) -> Vec<&UserMessage> {
+        history
+            .iter()
+            .filter_map(|m| match m {
+                Message::User(u) => Some(&u.user_input_message),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn total_media(history: &[Message], cur: &UserInputMessage) -> usize {
+        user_turns(history).iter().map(|u| u.images.len() + u.documents.len()).sum::<usize>()
+            + cur.images.len()
+            + cur.documents.len()
+    }
+
+    #[test]
+    fn media_count_at_limit_untouched() {
+        let mut history = history_with_images(&[1; 99]);
+        let mut cur = current_with(vec![], vec![tiny_img()]);
+        let before = serde_json::to_string(&history).unwrap();
+        let r = enforce_media_limits(&mut cur, &mut history);
+        assert_eq!(r, MediaLimitReport::default());
+        assert_eq!(serde_json::to_string(&history).unwrap(), before, "恰好 100 个不应动任何字节");
+        assert_eq!(cur.content, "look");
+    }
+
+    #[test]
+    fn media_count_over_limit_sheds_oldest_history_in_steps() {
+        // 线上原样:151 个。超 51 → 按 20 取整剔 60 → 剩 91。
+        let mut history = history_with_images(&[1; 150]);
+        let mut cur = current_with(vec![], vec![tiny_img()]);
+        let r = enforce_media_limits(&mut cur, &mut history);
+        assert_eq!(r.over_count_dropped, 60);
+        assert_eq!(total_media(&history, &cur), 91);
+        let turns = user_turns(&history);
+        for (i, u) in turns.iter().enumerate().take(60) {
+            assert!(u.images.is_empty(), "第 {i} 轮是最老的 60 个之一,应被剔");
+            assert!(u.content.starts_with(&format!("turn{i}\n[1 attachment(s) omitted")), "{}", u.content);
+        }
+        assert_eq!(turns[60].images.len(), 1, "第 61 轮起不动");
+        assert_eq!(turns[60].content, "turn60");
+        assert_eq!(cur.images.len(), 1, "历史够剔时当前轮不动");
+        assert_eq!(cur.content, "look");
+    }
+
+    #[test]
+    fn media_count_shed_boundary_stable_within_step() {
+        // 每轮新增截图:151 → 155 仍在同一步长内,已发出的前缀必须逐字节不变(上游前缀缓存)。
+        let render = |n: usize| {
+            let mut history = history_with_images(&vec![1; n]);
+            let mut cur = current_with(vec![], vec![]);
+            enforce_media_limits(&mut cur, &mut history);
+            history
+        };
+        let a = render(151);
+        let b = render(155);
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b[..a.len()]).unwrap(),
+            "同一步长内剔除边界不能移动"
+        );
+        // 跨过步长(161 → 超 61 → 剔 80)边界才整批后移。
+        let c = render(161);
+        assert!(user_turns(&c)[..80].iter().all(|u| u.images.is_empty()));
+        assert_eq!(user_turns(&c)[80].images.len(), 1);
+    }
+
+    #[test]
+    fn media_count_drops_documents_before_images_within_a_turn() {
+        let mut u = UserMessage::new("mixed", "claude-opus-5.5");
+        u.documents = (0..2)
+            .map(|i| KiroDocument::from_base64(format!("d{i}"), "pdf", b64_of_raw(10)))
+            .collect();
+        u.images = (0..3).map(|_| tiny_img()).collect();
+        let mut history = vec![Message::User(HistoryUserMessage { user_input_message: u })];
+        history.extend(history_with_images(&[1; 97]));
+        let mut cur = current_with(vec![], vec![]);
+        // 5 + 97 = 102 → 超 2 → 剔 20 里的前 5 个就是这一轮的全部,之后再剔 15 轮。
+        let r = enforce_media_limits(&mut cur, &mut history);
+        assert_eq!(r.over_count_dropped, 20);
+        let turns = user_turns(&history);
+        assert!(turns[0].documents.is_empty() && turns[0].images.is_empty());
+        assert!(turns[0].content.contains("[5 attachment(s) omitted"));
+        assert_eq!(total_media(&history, &cur), 82);
+    }
+
+    #[test]
+    fn media_count_partial_turn_keeps_newest_media() {
+        // 一轮带 30 张,超 5 → 剔 20:只剔这一轮最前面的 20 张,留后 10 张。
+        let mut history = history_with_images(&[30, 75]);
+        let mut cur = current_with(vec![], vec![]);
+        let r = enforce_media_limits(&mut cur, &mut history);
+        assert_eq!(r.over_count_dropped, 20);
+        let turns = user_turns(&history);
+        assert_eq!(turns[0].images.len(), 10);
+        assert!(turns[0].content.contains("[20 attachment(s) omitted"));
+        assert_eq!(turns[1].images.len(), 75);
+    }
+
+    #[test]
+    fn media_count_current_turn_trimmed_only_after_history_exhausted() {
+        let mut history = history_with_images(&[5]);
+        let mut cur = current_with(vec![], (0..110).map(|_| tiny_img()).collect());
+        let r = enforce_media_limits(&mut cur, &mut history);
+        // 超 15:历史 5 个剔光,当前轮再剔 10,刚好压到上限(当前轮不按步长多剔)。
+        assert_eq!(r.over_count_dropped, 15);
+        assert!(user_turns(&history)[0].images.is_empty());
+        assert_eq!(cur.images.len(), 100);
+        assert!(cur.content.starts_with("look\n[10 attachment(s) omitted"), "{}", cur.content);
+    }
+
+    #[test]
+    fn media_count_ignores_items_already_dropped_by_per_item_limits() {
+        // 当前轮那张超 5MB 的图先被逐项剔掉,剩下恰好 100 个,不再触发总数剔除。
+        let mut history = history_with_images(&[1; 100]);
+        let huge = KiroImage::from_base64("png", "A".repeat(MAX_IMAGE_BASE64_BYTES + 4));
+        let mut cur = current_with(vec![], vec![huge]);
+        let r = enforce_media_limits(&mut cur, &mut history);
+        assert_eq!(r.dropped_images, 1);
+        assert_eq!(r.over_count_dropped, 0);
+        assert!(user_turns(&history).iter().all(|u| u.images.len() == 1));
     }
 
     #[test]

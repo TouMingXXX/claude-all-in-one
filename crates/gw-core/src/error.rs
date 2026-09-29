@@ -222,7 +222,8 @@ pub struct UpstreamError {
     pub delivery: RequestDelivery,
     /// 允许对外展示的详情。`None` = 用 [`UpstreamErrorKind::client_message`] 的中性兜底。
     ///
-    /// **私有,只有两个入口:** [`Self::bad_request_visible`](我方本地文案)与
+    /// **私有,只有三个入口:** [`Self::bad_request_visible`](我方本地文案)、
+    /// [`Self::bad_request_with_hint`](上游拒绝 + 我方编译期字面量提示)与
     /// [`Self::content_filtered`](上游分类器拒答,只取结构化字段并清洗)。对抗评审三个镜头
     /// 一致指出:只要留一个「把任意 String 登记为对外文案」的公开 API,迟早有人顺手把上游
     /// 响应体传进去,fail-closed 就退化成靠自觉。任何新的对外展示需求都得显式改这里 ——
@@ -271,6 +272,17 @@ impl UpstreamError {
         let m = message.into();
         let mut e = Self::bad_request(m.clone());
         e.client_detail = Some(m);
+        e
+    }
+
+    /// 便捷构造:**上游**判定的非法请求,内部 `message` 留上游原文排障,对外只给我方提示语。
+    ///
+    /// `hint` 限定为 `&'static str`:调用方只能顺手传字面量,运行时拿到的上游响应体直接传不进来
+    /// (硬要 `Box::leak` 绕过就是故意的,评审拦)。
+    /// 用于上游 reason 明确、客户改请求就能解的 400(如媒体数量/体积超限)。
+    pub fn bad_request_with_hint(message: impl Into<String>, hint: &'static str) -> Self {
+        let mut e = Self::bad_request(message);
+        e.client_detail = Some(hint.to_string());
         e
     }
 
