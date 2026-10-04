@@ -309,6 +309,15 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// 从请求派生**调度钉号键**(粒度到「会话 + 线程」),只给最优控制调度器用。
+    ///
+    /// 与 [`Self::affinity_key`] 分开:后者还要进 `CallCtx.session_id/cache_key`(cursor 拿它
+    /// 做服务端续聊、dario 拿它做 `x-session-id`),语义不能动;本键只影响选号。
+    /// 默认 `None` = 该 provider 不提供线程粒度(调度器此时也不会对它启用最优控制调度)。
+    fn thread_key(&self, _req: &ChatRequest) -> Option<String> {
+        None
+    }
+
     /// 该账号能否服务该模型(调度选号过滤)。默认全部支持。
     ///
     /// Kiro 覆盖:FREE 订阅不支持 opus——不过滤的话 opus 请求会落到 FREE 号,

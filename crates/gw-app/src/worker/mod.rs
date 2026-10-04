@@ -5,6 +5,7 @@
 //! 选号走组内 v52 会话亲和调度(见 [`scheduler`]):同会话钉同账号,最大化 Kiro
 //! prefix cache 命中(缓存按上游账号隔离)。
 
+mod cost_index;
 mod scheduler;
 
 use std::path::Path;
@@ -1111,6 +1112,25 @@ pub async fn run(
     }
     let scheduler =
         AccountScheduler::new_with_lifecycles(accounts, &effective_system.scheduler, &lifecycles, lifecycle_enabled);
+    // 最优控制调度器只赋给 kiro worker:它的计费模型(冷热差价、429 规律)只在 Kiro 上标定过,
+    // cursor/dario worker 即使设置为 cost_index 也恒走旧版。环境变量 `KIRO_COST_INDEX=0`
+    // 可对单个 worker 急停(重启该 worker 生效),不改设置里的选择。
+    let scheduler = if cost_index_allowed(provider.family()) {
+        scheduler.with_cost_index(|a| {
+            if gw_kiro::headers::is_enterprise_priced(a) {
+                cost_index::PriceClass::Enterprise
+            } else {
+                cost_index::PriceClass::Personal
+            }
+        })
+    } else {
+        scheduler
+    };
+    tracing::info!(
+        cost_index_capable = scheduler.cost_index_capable(),
+        algorithm = scheduler.active_algorithm(),
+        "调度器就绪"
+    );
     if lifecycle_enabled {
         if let Some(s) = &store {
             scheduler.set_lifecycle_store(s.clone());
@@ -1675,6 +1695,9 @@ async fn health(State(st): State<Arc<WorkerState>>) -> impl IntoResponse {
         "accounts_status": accounts_status,
         // 排队实况(等待数 / 容量 / 已开号数),admin 账号页展示。
         "queue": st.scheduler.queue_stats(),
+        // 本 worker **实际在跑**的选号算法(能力 + 设置同时满足才是 cost_index)。
+        // 与 settings 里的配置意图分开报:cursor/dario worker 配置为 cost_index 时这里仍是 affinity。
+        "scheduler_algorithm_active": st.scheduler.active_algorithm(),
         // usage 是否在落库:库打开失败时为 false(降级,usage 不入库),便于运维发现。
         "usage_persist": st.usage_sink.is_some(),
         // 设置热调的实况:本 worker **真正在用**的值 + 最近一次同步的结果。
@@ -2445,6 +2468,24 @@ fn parse_group_header(headers: &HeaderMap) -> Result<Option<String>, String> {
     Ok(Some(name.to_string()))
 }
 
+/// 该 provider 的 worker 是否赋予最优控制调度能力:只给 kiro(计费模型只在 Kiro 上标定过),
+/// 且未被环境变量急停。
+fn cost_index_allowed(family: &str) -> bool {
+    family == "kiro" && cost_index_env_enabled()
+}
+
+/// 本 worker 是否允许最优控制调度器(环境变量急停开关)。`KIRO_COST_INDEX` 取
+/// `0/false/off/no`(大小写不敏感)即关闭;不设或其它值 = 允许(真正生效还看设置)。
+fn cost_index_env_enabled() -> bool {
+    !matches!(
+        std::env::var("KIRO_COST_INDEX")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("0" | "false" | "off" | "no")
+    )
+}
+
 /// 会话亲和键**按分组分命名空间**。
 ///
 /// 必须这么做的原因:scheduler 的亲和表是全 worker 共用、按会话键索引的,而会话键由
@@ -2769,6 +2810,26 @@ async fn handle_chat(
     // 更难查的中断。故在此处硬封顶:到点就把当前错误返回,让客户拿到明确结果。
     const RETRY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
     let retry_started = std::time::Instant::now();
+    // 最优控制调度器的选号提示。钉号键细到「会话 + 线程」(子代理各有各的热号);
+    // 它只影响选号 —— `affinity_key` 照旧进 CallCtx,计费 / cache_sim / cursor 续聊不受影响。
+    // 具备能力就传(两种算法下都据此维护热度表,切换算法时不会一波冷启动)。
+    let pin_key = if st.scheduler.cost_index_capable() {
+        group_scoped_affinity_key(group.as_deref(), client_scope, st.provider.thread_key(&req))
+    } else {
+        None
+    };
+    let pick_hints = scheduler::PickHints {
+        pin_key: pin_key.as_deref(),
+        // 输入量粗估只在新算法生效时算(一次遍历正文;不含 tool_result/图片,偏低)。
+        // 该线程有实测值时调度器取两者较大者 —— 真正起作用的场景(有热号可选)必有实测值。
+        input_tokens_est: if st.scheduler.cost_index_active() {
+            gw_kiro::text_tokens::count_request_tokens(&req.body)
+        } else {
+            0
+        },
+        // 等热号的预算从请求开始算,跨换号重试不叠加。
+        ci_wait_deadline: Some(retry_started + st.scheduler.cost_index_max_wait()),
+    };
     let mut attempts = 0;
 
     loop {
@@ -2779,8 +2840,9 @@ async fn handle_chat(
         //    模型的号——否则亲和会反复选中同一不支持的号(ModelNotAvailable 不禁号)死循环。
         let lease = match st
             .scheduler
-            .acquire_in_group_until(
+            .acquire_with_hints(
                 affinity_key.as_deref(),
+                &pick_hints,
                 |a| {
                     st.provider.account_supports_model(a, &req.model)
                         && !st.scheduler.is_model_unavailable(&a.account_id, &req.model)
@@ -4262,6 +4324,8 @@ async fn collect_response(
     if success {
         // 非流式折叠成功 = 完整成功(消息体已收齐),可清 suspend 退避进度。
         scheduler.report_success_observed(&account_id, lease.suspend_gen, true);
+        // 成功出过完整响应:该线程在这个号上变热,并记下实测输入量(最优控制调度器用)。
+        scheduler.note_thread_usage(&lease, last_usage.as_ref().map(|u| u.input_tokens), true);
     } else {
         let (kind, detail) = match &outcome {
             Outcome::Upstream(e) => (
@@ -4809,6 +4873,15 @@ async fn stream_response(
                         self.suspend_gen,
                         self.saw_message_stop,
                     );
+                    // 真的出过数据(拿到用量或走到 message_stop)才算把上游缓存填热了;
+                    // 只有完整结束才喂耗时估计(半截流的时长不代表请求耗时)。
+                    if self.last_usage.is_some() || self.saw_message_stop {
+                        self.st.scheduler.note_thread_usage(
+                            &self._lease,
+                            self.last_usage.as_ref().map(|u| u.input_tokens),
+                            self.saw_message_stop,
+                        );
+                    }
                 } else {
                     self.st.scheduler.report_failure_with_gen(
                         &self.account_id,
@@ -7701,5 +7774,94 @@ mod tests {
         let v = body_json(resp).await;
         assert_eq!(v["type"], "error");
         assert_eq!(v["error"]["type"], "overloaded_error");
+    }
+
+    // ================= 最优控制调度器接线 =================
+
+    /// kiro 系模拟 provider:恒成功回一段文本,提供线程钉号键。
+    struct CiWireProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for CiWireProvider {
+        fn family(&self) -> &'static str { "kiro" }
+        fn account_schema(&self) -> &'static [gw_core::account::FieldSpec] { &[] }
+        async fn list_models(&self) -> Result<Vec<gw_core::model::ModelInfo>, UpstreamError> { Ok(vec![]) }
+        async fn chat(&self, _: ChatRequest, _: &CallCtx) -> Result<gw_core::provider::ChatStream, UpstreamError> {
+            Ok(text_reply_stream())
+        }
+        async fn refresh_auth(&self, account: &Account) -> Result<Account, UpstreamError> { Ok(account.clone()) }
+        fn thread_key(&self, _req: &ChatRequest) -> Option<String> { Some("s/sess/thr".into()) }
+    }
+
+    fn ci_wire_state() -> Arc<WorkerState> {
+        let mut extra = BTreeMap::new();
+        extra.insert("access_token".into(), serde_json::json!("at"));
+        extra.insert("refresh_token".into(), serde_json::json!("rt"));
+        extra.insert("expires_at".into(), serde_json::json!("2099-01-01T00:00:00Z"));
+        extra.insert("profile_arn".into(), serde_json::json!("arn:aws:codewhisperer:us-east-1:1:profile/X"));
+        let acc = Arc::new(Account {
+            account_id: "a".into(),
+            provider: "kiro".into(),
+            max_concurrency: 2,
+            disabled: false,
+            created_at: 0,
+            extra,
+        });
+        Arc::new(WorkerState {
+            instance: 0,
+            egress_desc: String::new(),
+            group: String::new(),
+            provider: Arc::new(CiWireProvider),
+            settings_sync: parking_lot::RwLock::new(SettingsSync::default()),
+            scheduler: AccountScheduler::new(vec![acc], &gw_core::config::SchedulerConfig::default())
+                .with_cost_index(|_| cost_index::PriceClass::Personal),
+            refresh_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            rejection_refresh_at: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            usage_sink: None,
+            pending_writes: PendingWrites::new(),
+            store: None,
+            quota_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            quota_inflight: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            quota_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            sync_lock: tokio::sync::Mutex::new(()),
+            group_views: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            _client: reqwest::Client::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn cost_index_success_writes_thread_warmth_for_stream_and_non_stream() {
+        for stream in [true, false] {
+            let st = ci_wire_state();
+            assert_eq!(st.scheduler.active_algorithm(), "cost_index");
+            let resp = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                handle_chat(
+                    st.clone(),
+                    HeaderMap::new(),
+                    serde_json::json!({"model":"m","stream":stream,"max_tokens":10,
+                        "messages":[{"role":"user","content":"hello"}]}),
+                    Wire::Anthropic,
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            // 流式:消费完正文,StreamCtx 才 Drop 并回写。
+            let _ = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
+            let q = st.scheduler.queue_stats();
+            assert_eq!(q.ci_decisions, 1, "stream={stream}:走的是最优控制调度器");
+            assert_eq!(q.ci_threads, 1, "stream={stream}:成功收尾后线程热度已回写");
+        }
+    }
+
+    #[test]
+    fn cost_index_only_for_kiro_family() {
+        assert!(!cost_index_allowed("cursor"));
+        assert!(!cost_index_allowed("claude-dario"));
+        // 测试进程不设 KIRO_COST_INDEX → kiro 允许。
+        if std::env::var("KIRO_COST_INDEX").is_err() {
+            assert!(cost_index_allowed("kiro"));
+        }
     }
 }

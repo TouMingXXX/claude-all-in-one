@@ -377,6 +377,44 @@ async fn put_settings(
             }
             continue;
         }
+        // scheduler_algorithm:选号算法只接受已知取值。读侧的 `#[serde(other)]` 兜底是给
+        // 「更新镜像写入、本镜像不认识」的回滚场景用的,控制面绝不能主动写进一个未知值
+        // (通用路径会把它解析成 Unknown 放行,面板显示与实际执行就分叉了)。
+        if k == "scheduler_algorithm" {
+            let ok = v.as_str().and_then(|s| {
+                gw_core::config::SchedulerAlgorithm::SELECTABLE
+                    .iter()
+                    .find(|a| a.as_str() == s.trim())
+            });
+            match ok {
+                Some(a) => {
+                    overlay_map.insert(k, serde_json::json!(a.as_str()));
+                }
+                None => {
+                    return api_error(
+                        StatusCode::BAD_REQUEST,
+                        "scheduler_algorithm 须为 cost_index(最优控制调度器)或 affinity(亲和调度·旧版)",
+                    )
+                }
+            }
+            continue;
+        }
+        // 最优控制调度器参数:范围与调度器内部钳位一致;越界直接 400 给一句人话,
+        // 而不是写进去再被静默钳位(面板显示与实际生效分叉)。
+        if let Some((lo, hi, int_only, hint)) = cost_index_param_range(&k) {
+            let n = v.as_f64().filter(|n| n.is_finite());
+            let valid = n.is_some_and(|n| {
+                n >= lo && n <= hi && (!int_only || (n.fract() == 0.0 && v.is_u64()))
+            });
+            if !valid {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    &format!("{k} 须为 {lo}–{hi} 之间的{}({hint})", if int_only { "整数" } else { "数值" }),
+                );
+            }
+            overlay_map.insert(k, v);
+            continue;
+        }
         overlay_map.insert(k, v);
     }
 
@@ -412,6 +450,23 @@ async fn put_settings(
         return internal_error(e);
     }
     respond(effective(&st, &overlay))
+}
+
+
+/// 最优控制调度器数值参数的允许范围:`(下限, 上限, 是否必须整数, 说明)`。
+/// 与 `worker::cost_index::CiParams::from_config` 的钳位保持一致。
+fn cost_index_param_range(key: &str) -> Option<(f64, f64, bool, &'static str)> {
+    Some(match key {
+        "cost_index_kappa" => (0.0, 100.0, false, "积分/秒,多等 1 秒愿意付的积分"),
+        "cost_index_eta" => (0.0, 1000.0, false, "积分/次,每次 429 的风险成本"),
+        "cost_index_enterprise_price" => (0.01, 100.0, false, "企业号每积分相对个人号的倍数"),
+        "cost_index_start_spacing_ms" => (0.0, 10_000.0, true, "毫秒,0 = 不限"),
+        "cost_index_pace_ms" => (0.0, 60_000.0, true, "毫秒"),
+        "cost_index_pace_max_strikes" => (0.0, 100.0, true, "次,0 = 永不退回冷却"),
+        "cost_index_max_wait_ms" => (0.0, 120_000.0, true, "毫秒,须远小于 180 秒的请求重试时限"),
+        "cost_index_cache_ttl_secs" => (1.0, 3600.0, true, "秒"),
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -615,6 +670,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 400, "类型不合法应 400,不写坏库");
+    }
+
+    #[tokio::test]
+    async fn scheduler_algorithm_defaults_roundtrip_and_rejects_unknown() {
+        let (app, _store) = app();
+        // 默认:最优控制调度器 + 报告推荐参数。
+        let v0 = body_json(app.clone().oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(v0["scheduler_algorithm"], "cost_index");
+        assert_eq!(v0["cost_index_kappa"], 1.0);
+        assert_eq!(v0["cost_index_max_wait_ms"], 30_000);
+        assert_eq!(v0["cost_index_pace_personal"], false);
+        // 切到旧版并回读。
+        let v = body_json(
+            app.clone()
+                .oneshot(req("PUT", "/settings", Some(r#"{"scheduler_algorithm": "affinity", "cost_index_kappa": 0.3, "cost_index_pace_personal": true}"#)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["scheduler_algorithm"], "affinity");
+        assert_eq!(v["cost_index_kappa"], 0.3);
+        assert_eq!(v["cost_index_pace_personal"], true);
+        // 未知算法、非字符串一律 400,且不改动已存值。
+        for bad in [r#""foo""#, r#""unknown""#, "1"] {
+            let resp = app
+                .clone()
+                .oneshot(req("PUT", "/settings", Some(format!(r#"{{"scheduler_algorithm": {bad}}}"#).as_str())))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{bad} 应 400");
+        }
+        let v2 = body_json(app.clone().oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(v2["scheduler_algorithm"], "affinity");
+        // null 清除回默认。
+        let v3 = body_json(
+            app.oneshot(req("PUT", "/settings", Some(r#"{"scheduler_algorithm": null}"#))).await.unwrap(),
+        )
+        .await;
+        assert_eq!(v3["scheduler_algorithm"], "cost_index");
+    }
+
+    #[tokio::test]
+    async fn cost_index_params_are_range_checked() {
+        let (app, _store) = app();
+        for (k, bad) in [
+            ("cost_index_kappa", "-0.1"),
+            ("cost_index_kappa", "101"),
+            ("cost_index_eta", "1001"),
+            ("cost_index_enterprise_price", "0"),
+            ("cost_index_start_spacing_ms", "10001"),
+            ("cost_index_start_spacing_ms", "1.5"),
+            ("cost_index_pace_ms", "-1"),
+            ("cost_index_pace_max_strikes", "101"),
+            ("cost_index_max_wait_ms", "120001"),
+            ("cost_index_cache_ttl_secs", "0"),
+            ("cost_index_kappa", r#""1""#),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(req("PUT", "/settings", Some(format!(r#"{{"{k}": {bad}}}"#).as_str())))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{k}={bad} 应 400");
+        }
+        let v = body_json(
+            app.oneshot(req(
+                "PUT",
+                "/settings",
+                Some(r#"{"cost_index_kappa": 0, "cost_index_eta": 10, "cost_index_enterprise_price": 2.5, "cost_index_start_spacing_ms": 0, "cost_index_max_wait_ms": 120000, "cost_index_cache_ttl_secs": 3600}"#),
+            ))
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(v["cost_index_kappa"], 0.0);
+        assert_eq!(v["cost_index_enterprise_price"], 2.5);
+        assert_eq!(v["cost_index_max_wait_ms"], 120_000);
+        assert_eq!(v["cost_index_cache_ttl_secs"], 3600);
     }
 
     #[tokio::test]

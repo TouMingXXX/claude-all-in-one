@@ -171,6 +171,117 @@ pub fn affinity_key_from_body(body: &serde_json::Value) -> Option<String> {
     Some(derive_conversation_id(&req, messages, ""))
 }
 
+/// **调度钉号键**(会话 + 线程),只给 worker 调度器用,不进 wire、不影响计费与 cache_sim。
+///
+/// 为什么不直接用 [`affinity_key_from_body`]:带 `metadata.user_id` 会话号时,它就是会话 UUID
+/// —— Claude Code 同一会话的主对话与各个子代理共用一个会话号,却各有自己的 system 与首条
+/// 用户消息(前缀不同、上游缓存互不相通)。钉在同一个号上只会互相挤占并发位、制造溢出换号。
+/// 2026-09-30 采集:平均每会话 3.6 个线程,68.5% 的请求来自多线程会话。
+///
+/// 形态:有会话号 → `s/{会话UUID}/{指纹}`;无会话号 → `t/{指纹}`。
+/// 指纹 = system 前 [`SYSTEM_ANCHOR_PREFIX_LEN`] 字节(逐块剥 billing 指纹行后 `\n` 拼接,
+/// 与 `normalized_client_system` 同口径)+ **首条 user 消息的纯文本**(只取 text,忽略图片/
+/// tool_result 与 `cache_control`)。首条消息在历史里不变,所以指纹从第 1 轮起跨轮稳定;
+/// 旧的无会话号派生哈希前两条 user 的整段 JSON,第 1→2 轮必变,且随 cache_control 位置漂移。
+///
+/// 首条消息带图片/文档时,指纹再并入它们的轻量摘要(见 [`content_media_digest`]):
+/// 否则「同一句指令 + 每次不同的文档」这类单轮批处理会被当成**一条**线程 —— 调度器以为
+/// 它们共享缓存,全挤到同一个号上排队,实际每次内容都不同、一次也命中不了(2026-10-03 实测)。
+/// 纯文本首条消息的指纹与之前逐字节相同(上线不打散在途线程)。
+///
+/// 直接读 `&Value` 字段,**不 clone、不整体反序列化**(请求体可达数 MB,含 base64 图片)。
+/// 消息为空返回 `None`(调用方退化为无钉号选号)。
+pub fn thread_key_from_body(body: &serde_json::Value) -> Option<String> {
+    let messages = body.get("messages")?.as_array()?;
+    let first_user = messages
+        .iter()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))?;
+    let first_text = content_plain_text(first_user.get("content"));
+    let media = content_media_digest(first_user.get("content"));
+    let system = system_anchor_text(body.get("system"));
+    let anchor = session::safe_prefix(&system, SYSTEM_ANCHOR_PREFIX_LEN);
+    let mut parts: Vec<&[u8]> = vec![
+        b"thread-sys:",
+        anchor.as_bytes(),
+        b"thread-u1:",
+        first_text.as_bytes(),
+    ];
+    if !media.is_empty() {
+        parts.push(b"thread-m1:");
+        parts.push(media.as_bytes());
+    }
+    let fp = session::uuid_from_parts(&parts);
+    let sid = body
+        .get("metadata")
+        .and_then(|m| m.get("user_id"))
+        .and_then(|u| u.as_str())
+        .and_then(session::extract_session_id);
+    Some(match sid {
+        Some(sid) => format!("s/{sid}/{fp}"),
+        None => format!("t/{fp}"),
+    })
+}
+
+/// system 的归一化文本(`&Value` 版),与 `session::normalized_client_system` 同口径:
+/// 字符串 → 一块;数组 → 逐块取 `text`,各自剥 billing 指纹行后以 `\n` 拼接。
+fn system_anchor_text(system: Option<&serde_json::Value>) -> String {
+    match system {
+        Some(serde_json::Value::String(s)) => normalize::strip_rolling_fingerprints(s),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .map(normalize::strip_rolling_fingerprints)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// 一条消息 content 里图片/文档块的轻量摘要:每块取「类型 + 来源类型 + 媒体类型 + 数据长度 +
+/// 首尾各 32 个字符」。只读切片,不对整段 base64 做哈希(单图可达数 MB,每请求都要算一次)。
+/// 没有这类块返回空串。
+fn content_media_digest(content: Option<&serde_json::Value>) -> String {
+    const EDGE: usize = 32;
+    let Some(serde_json::Value::Array(blocks)) = content else { return String::new() };
+    let mut out = String::new();
+    for b in blocks {
+        let kind = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if kind != "image" && kind != "document" {
+            continue;
+        }
+        let src = b.get("source");
+        let field = |k: &str| src.and_then(|s| s.get(k)).and_then(|v| v.as_str()).unwrap_or("");
+        let payload = ["data", "url", "file_id"].iter().map(|k| field(k)).find(|v| !v.is_empty()).unwrap_or("");
+        let head: String = payload.chars().take(EDGE).collect();
+        let tail: String = {
+            let mut t: Vec<char> = payload.chars().rev().take(EDGE).collect();
+            t.reverse();
+            t.into_iter().collect()
+        };
+        out.push_str(&format!(
+            "{kind}|{}|{}|{}|{head}|{tail};",
+            field("type"),
+            field("media_type"),
+            payload.len()
+        ));
+    }
+    out
+}
+
+/// 一条消息 content 的纯文本:字符串原样;数组只拼 `type == "text"` 块的 text。
+fn content_plain_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
 /// 将 Anthropic 请求转换为 Kiro 请求
 pub fn convert_request(
     req: &MessagesRequest,

@@ -5,8 +5,15 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { ErrorNote } from '@/components/ui/error-note'
 import { RestockSettingsCard } from '@/features/restock/components/RestockSettingsCard'
+import { SchedulerAlgorithmCard } from '@/features/settings/components/SchedulerAlgorithmCard'
 import { WorkerEffectiveCard } from '@/features/settings/components/WorkerEffectiveCard'
 import { useSettings, useUpdateSettings } from '@/features/settings/hooks'
+import {
+  buildSchedulerPatch,
+  schedulerFormFromSettings,
+  validateSchedulerForm,
+  type SchedulerForm,
+} from '@/features/settings/scheduler'
 import { useGroups } from '@/features/groups/hooks'
 import type { SystemSettings, SystemSettingsPatch, ThinkingEffort } from '@/features/settings/types'
 import { THINKING_EFFORTS } from '@/features/settings/types'
@@ -279,6 +286,8 @@ export default function SettingsPage() {
   const mutation = useUpdateSettings()
 
   const [form, setForm] = useState<FormState | null>(null)
+  /** 调度器段(算法 + 参数)的表单态;字段元数据与增量 patch 逻辑在 features/settings/scheduler.ts。 */
+  const [schedulerForm, setSchedulerForm] = useState<SchedulerForm | null>(null)
   const [saved, setSaved] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -287,6 +296,7 @@ export default function SettingsPage() {
   useEffect(() => {
     if (data !== undefined && form === null) {
       setForm(settingsToForm(data))
+      setSchedulerForm(schedulerFormFromSettings(data))
     }
   }, [data, form])
 
@@ -294,6 +304,13 @@ export default function SettingsPage() {
     setSaved(false)
     setForm((prev) => (prev === null ? prev : { ...prev, [key]: value }))
   }
+
+  const setScheduler = <K extends keyof SchedulerForm>(key: K, value: SchedulerForm[K]) => {
+    setSaved(false)
+    setSchedulerForm((prev) => (prev === null ? prev : { ...prev, [key]: value }))
+  }
+  const schedulerErrors =
+    schedulerForm !== null && data !== undefined ? validateSchedulerForm(schedulerForm, data) : {}
 
   // 分组暖机策略行的增删改(不走 set():它是数组不是标量)。
   const setPolicyRow = (idx: number, patch: Partial<WarmupPolicyRow>) => {
@@ -333,7 +350,7 @@ export default function SettingsPage() {
 
   const handleSubmit = (event: FormEvent) => {
     event.preventDefault()
-    if (!form || !data || mutation.isPending) return
+    if (!form || !schedulerForm || !data || mutation.isPending) return
 
     // 两期顺序守卫(对抗审核 [中]):phase2 < phase1 时 phase2 永远命不中
     // (号龄到 phase1 后直接毕业),存进去就是一份静默失效的配置。
@@ -343,9 +360,14 @@ export default function SettingsPage() {
       setFormError(t('settings.field.warmupPhaseOrderError'))
       return
     }
+    // 调度器参数:后端 PUT 对越界值回 400 且整次保存作废,在前端先拦。
+    if (Object.keys(schedulerErrors).length > 0) {
+      setFormError(t('settings.schedulerAlgo.invalidSubmit'))
+      return
+    }
     setFormError(null)
 
-    const patch = buildPatch(form, data)
+    const patch = { ...buildPatch(form, data), ...buildSchedulerPatch(schedulerForm, data) }
     if (Object.keys(patch).length === 0) {
       setSaved(true)
       return
@@ -354,6 +376,7 @@ export default function SettingsPage() {
     mutation.mutate(patch, {
       onSuccess: (newData) => {
         setForm(settingsToForm(newData))
+        setSchedulerForm(schedulerFormFromSettings(newData))
         setSaved(true)
         if (savedTimerRef.current !== null) clearTimeout(savedTimerRef.current)
         savedTimerRef.current = setTimeout(() => setSaved(false), 3000)
@@ -673,6 +696,14 @@ export default function SettingsPage() {
             </label>
           </CardContent>
         </Card>
+
+        {/* ── 调度器(算法 + 参数) ── */}
+        <SchedulerAlgorithmCard
+          form={schedulerForm}
+          errors={schedulerErrors}
+          disabled={isLoading || schedulerForm === null}
+          onChange={setScheduler}
+        />
 
         {/* ── 新号暖机 ── */}
         <Card>

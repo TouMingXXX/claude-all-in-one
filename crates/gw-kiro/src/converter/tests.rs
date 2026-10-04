@@ -3084,3 +3084,136 @@ fn convert_request_rewrites_stage2_thinking_directive_for_5_5_models_only() {
     let c = content("claude-sonnet-5");
     assert!(c.contains("Use <thinking> before responding with <block>."), "sonnet-5 不动: {c}");
 }
+
+// ============ 调度钉号键(会话 + 线程),见 thread_key_from_body ============
+
+fn cc_body(system: serde_json::Value, messages: serde_json::Value, sid: Option<&str>) -> serde_json::Value {
+    let mut b = serde_json::json!({
+        "model": "claude-opus-5-5",
+        "max_tokens": 100,
+        "system": system,
+        "messages": messages,
+    });
+    if let Some(sid) = sid {
+        b["metadata"] = serde_json::json!({"user_id": format!("user_abc_account__session_{sid}")});
+    }
+    b
+}
+
+const SID: &str = "0b4445e1-f5be-49e1-87ce-62bbc28ad705";
+
+#[test]
+fn thread_key_is_stable_across_turns_and_cache_control_moves() {
+    let sys = serde_json::json!([{"type": "text", "text": "You are Claude Code."}]);
+    let t1 = cc_body(sys.clone(), serde_json::json!([
+        {"role": "user", "content": [{"type": "text", "text": "fix the bug", "cache_control": {"type": "ephemeral"}}]}
+    ]), Some(SID));
+    let t3 = cc_body(sys, serde_json::json!([
+        {"role": "user", "content": [{"type": "text", "text": "fix the bug"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "done"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "next"}]},
+        {"role": "user", "content": [{"type": "text", "text": "thanks", "cache_control": {"type": "ephemeral"}}]}
+    ]), Some(SID));
+    let k1 = thread_key_from_body(&t1).unwrap();
+    let k3 = thread_key_from_body(&t3).unwrap();
+    assert_eq!(k1, k3, "同一线程第 1 轮与第 3 轮的钉号键必须相同(cache_control 移动不影响)");
+    assert!(k1.starts_with(&format!("s/{SID}/")), "带会话号时以会话号为作用域:{k1}");
+}
+
+#[test]
+fn thread_key_separates_subagents_of_one_session() {
+    let main = cc_body(serde_json::json!("You are Claude Code, main agent."),
+        serde_json::json!([{"role": "user", "content": "refactor module"}]), Some(SID));
+    let sub = cc_body(serde_json::json!("You are a search subagent."),
+        serde_json::json!([{"role": "user", "content": "find usages of foo"}]), Some(SID));
+    let sub2 = cc_body(serde_json::json!("You are a search subagent."),
+        serde_json::json!([{"role": "user", "content": "find usages of bar"}]), Some(SID));
+    let (a, b, c) = (
+        thread_key_from_body(&main).unwrap(),
+        thread_key_from_body(&sub).unwrap(),
+        thread_key_from_body(&sub2).unwrap(),
+    );
+    assert_ne!(a, b, "同会话、不同 system 的子代理必须分开钉号");
+    assert_ne!(b, c, "同 system、不同任务的子代理也必须分开");
+    // 旧的亲和键对三者相同(都是会话号),这正是要修的问题。
+    assert_eq!(affinity_key_from_body(&main), affinity_key_from_body(&sub));
+}
+
+#[test]
+fn thread_key_without_session_is_stable_from_turn_one() {
+    let sys = serde_json::json!("sys prompt");
+    let t1 = cc_body(sys.clone(), serde_json::json!([{"role": "user", "content": "hello"}]), None);
+    let t2 = cc_body(sys, serde_json::json!([
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "hi"},
+        {"role": "user", "content": "more"}
+    ]), None);
+    let (k1, k2) = (thread_key_from_body(&t1).unwrap(), thread_key_from_body(&t2).unwrap());
+    assert_eq!(k1, k2, "无会话号时从第 1 轮起就稳定");
+    assert!(k1.starts_with("t/"));
+    // 对照:旧派生哈希前两条 user,第 1→2 轮会变。
+    assert_ne!(affinity_key_from_body(&t1), affinity_key_from_body(&t2));
+}
+
+#[test]
+fn thread_key_separates_same_instruction_with_different_attachments() {
+    let img = |data: &str| serde_json::json!({
+        "type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}
+    });
+    let doc = |data: &str| serde_json::json!({
+        "type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": data}
+    });
+    let body = |block: serde_json::Value| cc_body(serde_json::json!("sys"), serde_json::json!([
+        {"role": "user", "content": [block, {"type": "text", "text": "提取这份文件里的表格"}]}
+    ]), None);
+    let a1 = body(img(&format!("AAAA{}", "x".repeat(5000))));
+    let a2 = body(img(&format!("AAAA{}", "x".repeat(5000))));
+    let b = body(img(&format!("BBBB{}", "x".repeat(5000))));
+    let c = body(doc(&format!("AAAA{}", "x".repeat(5000))));
+    let k = |v: &serde_json::Value| thread_key_from_body(v).unwrap();
+    assert_eq!(k(&a1), k(&a2), "同一附件同一指令是同一线程");
+    assert_ne!(k(&a1), k(&b), "同一指令、不同附件的单轮批处理不能并成一条线程");
+    assert_ne!(k(&a1), k(&c), "图片与文档分开");
+    // 首条带附件的多轮会话:后续轮次指纹不变。
+    let t3 = cc_body(serde_json::json!("sys"), serde_json::json!([
+        {"role": "user", "content": [img(&format!("AAAA{}", "x".repeat(5000))), {"type": "text", "text": "提取这份文件里的表格"}]},
+        {"role": "assistant", "content": "好的"},
+        {"role": "user", "content": [img("later-image"), {"type": "text", "text": "再看这张"}]}
+    ]), None);
+    assert_eq!(k(&a1), k(&t3), "后续轮次的附件不影响指纹");
+    // 纯文本首条消息不受影响:与只含同一文本的旧形态一致。
+    let plain = cc_body(serde_json::json!("sys"),
+        serde_json::json!([{"role": "user", "content": [{"type": "text", "text": "提取这份文件里的表格"}]}]), None);
+    let plain_str = cc_body(serde_json::json!("sys"),
+        serde_json::json!([{"role": "user", "content": "提取这份文件里的表格"}]), None);
+    assert_eq!(k(&plain), k(&plain_str));
+    assert_ne!(k(&plain), k(&a1));
+}
+
+#[test]
+fn thread_key_ignores_billing_fingerprint_lines_and_empty_messages() {
+    let a = cc_body(serde_json::json!("x-anthropic-billing-header: cch=ab12c;\nReal system."),
+        serde_json::json!([{"role": "user", "content": "q"}]), None);
+    let b = cc_body(serde_json::json!("x-anthropic-billing-header: cch=ffff9;\nReal system."),
+        serde_json::json!([{"role": "user", "content": "q"}]), None);
+    assert_eq!(thread_key_from_body(&a), thread_key_from_body(&b), "滚动 billing 指纹不得拆分线程");
+    let empty = cc_body(serde_json::json!("s"), serde_json::json!([]), Some(SID));
+    assert_eq!(thread_key_from_body(&empty), None);
+}
+
+#[test]
+fn thread_key_system_anchor_matches_normalized_client_system() {
+    // `&Value` 版的 system 归一化必须与反序列化版 normalized_client_system 逐字一致(防漂移)。
+    for sys in [
+        serde_json::json!("x-anthropic-billing-header: cch=ab12c;\nplain string system"),
+        serde_json::json!([
+            {"type": "text", "text": "block one", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "x-anthropic-billing-header: cch=00000;\nblock two"}
+        ]),
+    ] {
+        let body = cc_body(sys.clone(), serde_json::json!([{"role": "user", "content": "hi"}]), None);
+        let req: MessagesRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(system_anchor_text(Some(&sys)), normalized_client_system(&req));
+    }
+}

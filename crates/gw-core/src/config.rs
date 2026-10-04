@@ -602,6 +602,51 @@ fn default_max_sessions() -> usize {
     4096
 }
 
+/// 账号选号算法(热切换,见 [`SchedulerConfig::scheduler_algorithm`])。
+///
+/// - `CostIndex`(默认):最优控制调度器。每次选号对候选号估「预期代价」
+///   `单价·积分(上下文, 冷/热) + κ·预计等待 + P(429)·(κ·重试耗时 + η)`,取最小。
+///   依据见 2026-09-30 调度研究报告(caio-sched-sim/report):换号冷启动是积分变贵的主因,
+///   该策略在历史高峰回放中比旧版省约 15% 积分,等待 p95 约 1–1.5s。
+/// - `Affinity`:旧版「亲和 + 溢出」。会话钉号,主号忙等 `affinity_hold_ms` 后溢出伙伴号,
+///   429 冷却后改钉。选它时行为与引入本开关前逐字节一致。
+///
+/// `Unknown` 是 `#[serde(other)]` 兜底:更新镜像写入的新取值被旧镜像读到时,不能让整份
+/// 设置叠加层解析失败(那会冻结所有热设置,见 worker 30s 同步循环)。叠加层里的 `Unknown`
+/// 被 [`SystemSettings::apply_to`] 跳过;YAML 基线里的 `Unknown` 按 [`Self::resolved`] 退回旧版。
+/// `PUT /settings` 对未知取值直接 400,所以控制面写不进去。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerAlgorithm {
+    #[default]
+    CostIndex,
+    Affinity,
+    #[serde(other)]
+    Unknown,
+}
+
+impl SchedulerAlgorithm {
+    /// 实际执行的算法:未知取值保守退回旧版。
+    pub fn resolved(self) -> SchedulerAlgorithm {
+        match self {
+            SchedulerAlgorithm::Unknown => SchedulerAlgorithm::Affinity,
+            other => other,
+        }
+    }
+
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            SchedulerAlgorithm::CostIndex => "cost_index",
+            SchedulerAlgorithm::Affinity => "affinity",
+            SchedulerAlgorithm::Unknown => "unknown",
+        }
+    }
+
+    /// 控制面允许写入的取值(不含 `Unknown`)。
+    pub const SELECTABLE: [SchedulerAlgorithm; 2] =
+        [SchedulerAlgorithm::CostIndex, SchedulerAlgorithm::Affinity];
+}
+
 /// 账号调度/冷却参数(worker 启动时注入 AccountScheduler)。
 ///
 /// 默认值对齐 kiro.rs 生产配置(rateLimitCooldownSecs=300 / emptyResponse 60s·3次·60s窗 /
@@ -789,6 +834,76 @@ pub struct SchedulerConfig {
     /// 让「哪个组要保护、保护多狠、保护多久」可按业务线分别拍板,互不拖累。
     #[serde(default)]
     pub warmup_group_policies: std::collections::BTreeMap<String, GroupWarmupPolicy>,
+    /// **选号算法**(热切换)。默认 `cost_index` = 最优控制调度器;`affinity` = 旧版。
+    /// 只在具备能力的 worker(kiro,且未设环境变量 `KIRO_COST_INDEX=0`)上生效,
+    /// 其余 worker 恒走旧版。详见 [`SchedulerAlgorithm`]。
+    #[serde(default)]
+    pub scheduler_algorithm: SchedulerAlgorithm,
+    /// 最优控制调度器:**等待代价 κ**(积分/秒)—— 多等 1 秒愿意付多少积分。
+    /// 越小越愿意等热号(省积分、延迟高),越大越快换号。研究报告推荐 1。
+    #[serde(default = "default_cost_index_kappa")]
+    pub cost_index_kappa: f64,
+    /// 最优控制调度器:**429 风险价 η**(积分/次)—— 每撞一次 429 记的风险成本(封号风险的代理)。
+    #[serde(default = "default_cost_index_eta")]
+    pub cost_index_eta: f64,
+    /// 最优控制调度器:**个人号起跑间隔**(毫秒)。同号两次起跑至少隔这么久;
+    /// 2026-09-30 受控实验:同一瞬间起跑多个请求易 429,错开 1–2s 可避免。0 = 不限。
+    #[serde(default = "default_cost_index_start_spacing_ms")]
+    pub cost_index_start_spacing_ms: u64,
+    /// 最优控制调度器:**个人号 429 节流时长**(毫秒),只在 `cost_index_pace_personal` 打开时生效。
+    /// 节流的号不下线、不改钉,到点继续参与选号。
+    /// ⚠️ 排队号(`queue_enabled`,企业号形态)**不看这里**:两种算法下都只认
+    /// `rate_limit_pace_ms` / `rate_limit_pace_max_strikes`(生产熔断 0 = 永不因 429 下线)。
+    #[serde(default = "default_cost_index_pace_ms")]
+    pub cost_index_pace_ms: u64,
+    /// 最优控制调度器:**个人号节流熔断**。连续 429 超过这么多次退回普通冷却;0 = 永不退回。
+    /// 同样只作用于开了 `cost_index_pace_personal` 的个人号,排队号不看这里。
+    #[serde(default = "default_cost_index_pace_max_strikes")]
+    pub cost_index_pace_max_strikes: u32,
+    /// 最优控制调度器:个人号 429 后也短节流(默认关)。
+    /// ⚠️ 历史上「定频探测」曾在 22 分钟内送走 5 个号(见 `rate_limit_pace_ms` 注释);
+    /// 关闭时个人号照旧冷却 `rate_limit_cooldown_secs`,但**不再永久改钉**(冷却中的热号
+    /// 作为「要等的候选」参与比较)。
+    #[serde(default)]
+    pub cost_index_pace_personal: bool,
+    /// 最优控制调度器:**单请求最长等待**(毫秒,从请求开始算,不随重试叠加)。
+    /// 超过后只选能立刻起跑的号;仍没有则本次取号退回旧版循环。须远小于 180s 的请求重试时限。
+    #[serde(default = "default_cost_index_max_wait_ms")]
+    pub cost_index_max_wait_ms: u64,
+    /// 最优控制调度器:**企业号积分相对单价**(个人号 = 1)。
+    #[serde(default = "default_cost_index_enterprise_price")]
+    pub cost_index_enterprise_price: f64,
+    /// 最优控制调度器:**上游缓存有效期**(秒)。同一线程在同一号上多久内算「热」。
+    /// 2026-09-30 实测:同号 5 分钟内再访问 5–13% 冷,超过 5 分钟约 70% 冷。
+    /// 2026-10-04 起它是热度曲线的时间尺度(`cost_index::WARMTH_CURVE` 按它伸缩),
+    /// 线程在哪些号上跑过记 6 倍长(默认 30 分钟),过了 TTL 仍会优先回原号。
+    #[serde(default = "default_cost_index_cache_ttl_secs")]
+    pub cost_index_cache_ttl_secs: u64,
+}
+
+fn default_cost_index_kappa() -> f64 {
+    1.0
+}
+fn default_cost_index_eta() -> f64 {
+    3.0
+}
+fn default_cost_index_start_spacing_ms() -> u64 {
+    1000
+}
+fn default_cost_index_pace_ms() -> u64 {
+    1000
+}
+fn default_cost_index_pace_max_strikes() -> u32 {
+    3
+}
+fn default_cost_index_max_wait_ms() -> u64 {
+    30_000
+}
+fn default_cost_index_enterprise_price() -> f64 {
+    3.0
+}
+fn default_cost_index_cache_ttl_secs() -> u64 {
+    300
 }
 
 fn default_rate_limit_cooldown_secs() -> u64 {
@@ -908,6 +1023,16 @@ impl Default for SchedulerConfig {
             warmup_phase2_rpm: default_warmup_phase2_rpm(),
             rpm_wait_ms: default_rpm_wait_ms(),
             warmup_group_policies: std::collections::BTreeMap::new(),
+            scheduler_algorithm: SchedulerAlgorithm::default(),
+            cost_index_kappa: default_cost_index_kappa(),
+            cost_index_eta: default_cost_index_eta(),
+            cost_index_start_spacing_ms: default_cost_index_start_spacing_ms(),
+            cost_index_pace_ms: default_cost_index_pace_ms(),
+            cost_index_pace_max_strikes: default_cost_index_pace_max_strikes(),
+            cost_index_pace_personal: false,
+            cost_index_max_wait_ms: default_cost_index_max_wait_ms(),
+            cost_index_enterprise_price: default_cost_index_enterprise_price(),
+            cost_index_cache_ttl_secs: default_cost_index_cache_ttl_secs(),
         }
     }
 }
@@ -1103,6 +1228,28 @@ pub struct SystemSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warmup_group_policies:
         Option<std::collections::BTreeMap<String, GroupWarmupPolicy>>,
+    /// 选号算法(None = 用基线默认 `cost_index`)。未知取值解析为 `Unknown` 并被 `apply_to` 跳过。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_algorithm: Option<SchedulerAlgorithm>,
+    /// 以下 9 项为最优控制调度器参数,语义见 [`SchedulerConfig`] 同名字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_index_kappa: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_index_eta: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_index_start_spacing_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_index_pace_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_index_pace_max_strikes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_index_pace_personal: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_index_max_wait_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_index_enterprise_price: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_index_cache_ttl_secs: Option<u64>,
     // —— image ——
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_enabled: Option<bool>,
@@ -1224,6 +1371,21 @@ impl SystemSettings {
         if let Some(v) = &self.warmup_group_policies {
             base.scheduler.warmup_group_policies = v.clone();
         }
+        // 未知算法取值(更新镜像写入、本镜像不认识)跳过,保留基线,不让它冒充成某个已知算法。
+        if let Some(v) = self.scheduler_algorithm {
+            if v != SchedulerAlgorithm::Unknown {
+                base.scheduler.scheduler_algorithm = v;
+            }
+        }
+        if let Some(v) = self.cost_index_kappa { base.scheduler.cost_index_kappa = v; }
+        if let Some(v) = self.cost_index_eta { base.scheduler.cost_index_eta = v; }
+        if let Some(v) = self.cost_index_start_spacing_ms { base.scheduler.cost_index_start_spacing_ms = v; }
+        if let Some(v) = self.cost_index_pace_ms { base.scheduler.cost_index_pace_ms = v; }
+        if let Some(v) = self.cost_index_pace_max_strikes { base.scheduler.cost_index_pace_max_strikes = v; }
+        if let Some(v) = self.cost_index_pace_personal { base.scheduler.cost_index_pace_personal = v; }
+        if let Some(v) = self.cost_index_max_wait_ms { base.scheduler.cost_index_max_wait_ms = v; }
+        if let Some(v) = self.cost_index_enterprise_price { base.scheduler.cost_index_enterprise_price = v; }
+        if let Some(v) = self.cost_index_cache_ttl_secs { base.scheduler.cost_index_cache_ttl_secs = v; }
         if let Some(v) = self.image_enabled { base.image.enabled = v; }
         if let Some(v) = self.image_max_long_edge { base.image.max_long_edge = v; }
         if let Some(v) = self.image_max_pixels_single { base.image.max_pixels_single = v; }
@@ -1299,6 +1461,18 @@ impl SystemSettings {
             warmup_phase2_rpm: Some(cfg.scheduler.warmup_phase2_rpm),
             rpm_wait_ms: Some(cfg.scheduler.rpm_wait_ms),
             warmup_group_policies: Some(cfg.scheduler.warmup_group_policies.clone()),
+            // 展示「配置意图」;未知取值按实际执行口径显示为旧版。某个 worker 是否真的在跑
+            // 最优控制调度器(能力开关)另见 worker /health 的 `scheduler_algorithm_active`。
+            scheduler_algorithm: Some(cfg.scheduler.scheduler_algorithm.resolved()),
+            cost_index_kappa: Some(cfg.scheduler.cost_index_kappa),
+            cost_index_eta: Some(cfg.scheduler.cost_index_eta),
+            cost_index_start_spacing_ms: Some(cfg.scheduler.cost_index_start_spacing_ms),
+            cost_index_pace_ms: Some(cfg.scheduler.cost_index_pace_ms),
+            cost_index_pace_max_strikes: Some(cfg.scheduler.cost_index_pace_max_strikes),
+            cost_index_pace_personal: Some(cfg.scheduler.cost_index_pace_personal),
+            cost_index_max_wait_ms: Some(cfg.scheduler.cost_index_max_wait_ms),
+            cost_index_enterprise_price: Some(cfg.scheduler.cost_index_enterprise_price),
+            cost_index_cache_ttl_secs: Some(cfg.scheduler.cost_index_cache_ttl_secs),
             image_enabled: Some(cfg.image.enabled),
             image_max_long_edge: Some(cfg.image.max_long_edge),
             image_max_pixels_single: Some(cfg.image.max_pixels_single),
@@ -1563,6 +1737,86 @@ workers:
         let yaml = "cache:\n  read_multiplier: 1.0\n  cap_ratio: 0.9\n  floor_ratio: 0.1\nempty_response:\n  buffered_fallback: true\n";
         let cfg: SystemConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.cache.cap_ratio, 0.9);
+    }
+
+    #[test]
+    fn scheduler_algorithm_defaults_to_cost_index() {
+        let c = SchedulerConfig::default();
+        assert_eq!(c.scheduler_algorithm, SchedulerAlgorithm::CostIndex);
+        assert_eq!(c.cost_index_kappa, 1.0);
+        assert_eq!(c.cost_index_eta, 3.0);
+        assert_eq!(c.cost_index_start_spacing_ms, 1000);
+        assert_eq!(c.cost_index_pace_ms, 1000);
+        assert_eq!(c.cost_index_pace_max_strikes, 3);
+        assert!(!c.cost_index_pace_personal);
+        assert_eq!(c.cost_index_max_wait_ms, 30_000);
+        assert_eq!(c.cost_index_enterprise_price, 3.0);
+        assert_eq!(c.cost_index_cache_ttl_secs, 300);
+        // YAML 里没写 scheduler 段的这些键时,serde 默认与 Default 同口径。
+        let from_yaml: SchedulerConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(from_yaml.scheduler_algorithm, SchedulerAlgorithm::CostIndex);
+        assert_eq!(from_yaml.cost_index_max_wait_ms, 30_000);
+    }
+
+    #[test]
+    fn example_system_yaml_parses_with_scheduler_algorithm() {
+        let yaml = include_str!("../../../config/system.example.yaml");
+        let cfg: SystemConfig = serde_yaml::from_str(yaml).expect("system.example.yaml 须能解析");
+        assert_eq!(cfg.scheduler.scheduler_algorithm, SchedulerAlgorithm::CostIndex);
+        assert_eq!(cfg.scheduler.cost_index_max_wait_ms, 30_000);
+        assert!(!cfg.scheduler.cost_index_pace_personal);
+    }
+
+    #[test]
+    fn scheduler_algorithm_overlay_applies_and_roundtrips() {
+        let s: SystemSettings = serde_json::from_value(serde_json::json!({
+            "scheduler_algorithm": "affinity",
+            "cost_index_kappa": 0.3,
+            "cost_index_pace_personal": true,
+            "cost_index_cache_ttl_secs": 120,
+        }))
+        .unwrap();
+        let mut base = SystemConfig::default();
+        s.apply_to(&mut base);
+        assert_eq!(base.scheduler.scheduler_algorithm, SchedulerAlgorithm::Affinity);
+        assert_eq!(base.scheduler.cost_index_kappa, 0.3);
+        assert!(base.scheduler.cost_index_pace_personal);
+        assert_eq!(base.scheduler.cost_index_cache_ttl_secs, 120);
+        // 未给的参数保持默认。
+        assert_eq!(base.scheduler.cost_index_eta, 3.0);
+        // 全量视图带上全部新字段,序列化为 snake_case 串。
+        let full = SystemSettings::from_effective(&base, None);
+        let v = serde_json::to_value(&full).unwrap();
+        assert_eq!(v["scheduler_algorithm"], "affinity");
+        assert_eq!(v["cost_index_kappa"], 0.3);
+        assert_eq!(v["cost_index_max_wait_ms"], 30_000);
+        assert_eq!(v["cost_index_enterprise_price"], 3.0);
+    }
+
+    #[test]
+    fn unknown_scheduler_algorithm_must_not_void_the_overlay() {
+        // 更新镜像写入的新取值被本镜像读到:整份叠加层仍须解析成功,其余字段照常生效,
+        // 算法本身保留基线(不冒充成任何已知算法)。
+        let s: SystemSettings = serde_json::from_value(serde_json::json!({
+            "scheduler_algorithm": "some_future_algo",
+            "max_failures": 7,
+            "cost_index_kappa": 2.0,
+        }))
+        .expect("未知算法取值不能让整份设置解析失败");
+        assert_eq!(s.scheduler_algorithm, Some(SchedulerAlgorithm::Unknown));
+        let mut base = SystemConfig::default();
+        base.scheduler.scheduler_algorithm = SchedulerAlgorithm::Affinity;
+        s.apply_to(&mut base);
+        assert_eq!(base.scheduler.scheduler_algorithm, SchedulerAlgorithm::Affinity);
+        assert_eq!(base.scheduler.max_failures, 7);
+        assert_eq!(base.scheduler.cost_index_kappa, 2.0);
+        // YAML 基线本身是未知取值时,按实际执行口径退回旧版展示。
+        let mut weird = SystemConfig::default();
+        weird.scheduler.scheduler_algorithm = SchedulerAlgorithm::Unknown;
+        let full = SystemSettings::from_effective(&weird, None);
+        assert_eq!(full.scheduler_algorithm, Some(SchedulerAlgorithm::Affinity));
+        assert_eq!(SchedulerAlgorithm::Unknown.resolved(), SchedulerAlgorithm::Affinity);
+        assert_eq!(SchedulerAlgorithm::CostIndex.resolved(), SchedulerAlgorithm::CostIndex);
     }
 
     #[test]

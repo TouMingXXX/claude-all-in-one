@@ -34,10 +34,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gw_core::account::Account;
-use gw_core::config::{GroupWarmupPolicy, SchedulerConfig};
+use gw_core::config::{GroupWarmupPolicy, SchedulerAlgorithm, SchedulerConfig};
 use gw_core::error::UpstreamErrorKind;
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use super::cost_index::{self as ci, CiParams, PriceClass};
 
 /// 调度参数(由 system.yaml `scheduler` 段注入;默认值见 [`SchedulerConfig`],
 /// 对齐 kiro.rs 生产配置)。全部 clamp 到 ≥1,杜绝 0 值造成"必禁用/必过期"。
@@ -90,6 +92,11 @@ struct Tuning {
     tier_hold_window: Duration,
     /// 低优先新号暖机参数(详见 [`WarmupTuning`])。
     warmup: WarmupTuning,
+    /// 选号算法(已按 [`SchedulerAlgorithm::resolved`] 解析,不含 `Unknown`)。
+    /// 只在具备能力的调度器上生效(见 [`AccountScheduler::with_cost_index`])。
+    algorithm: SchedulerAlgorithm,
+    /// 最优控制调度器参数(已钳位)。
+    ci: CiParams,
 }
 
 /// 低优先新号暖机参数(由 [`SchedulerConfig`] 的 `warmup_*` 字段注入,随 update_tuning 热更)。
@@ -202,6 +209,8 @@ impl From<&SchedulerConfig> for Tuning {
                 phase2_rpm: c.warmup_phase2_rpm.max(1),
                 group_policies: Arc::new(c.warmup_group_policies.clone()),
             },
+            algorithm: c.scheduler_algorithm.resolved(),
+            ci: CiParams::from_config(c),
         }
     }
 }
@@ -406,6 +415,17 @@ struct CredentialState {
     /// cuts/drain_until。lease 选号时快照;迟到的旧代际上报一律丢弃,
     /// 防止老流的 Drop 把前兆记到「救回来」的新运行态上(codex 对抗评审#7)。
     epoch: u64,
+    /// 最近一次 429 的时刻(最优控制调度器估 429 概率用;具备能力才记)。
+    last_429_at: Option<Instant>,
+    /// 最近一次**成功领到并发许可**(起跑)的时刻。个人号起跑间隔用;
+    /// 与 `last_selected_at` 不同,后者在 try_lease 失败时也会被置位。
+    last_start_at: Option<Instant>,
+    /// 在途表:(登记号, 起跑时刻)。lease 里的 [`InflightGuard`] 在 Drop 时删掉自己那条。
+    /// 独立的 `Arc<Mutex>`,不随并发上限变化换信号量而丢失;锁序 `entries → inflight`,
+    /// Drop 只拿它自己的锁。
+    inflight: Arc<Mutex<Vec<(u64, Instant)>>>,
+    /// 此刻正为等这个号而睡眠的请求数(最优控制调度器排队估计用,RAII 维护)。
+    ci_waiters: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl CredentialState {
@@ -441,6 +461,10 @@ impl CredentialState {
             cuts: std::collections::VecDeque::new(),
             drain_until: None,
             epoch: next_cut_epoch(),
+            last_429_at: None,
+            last_start_at: None,
+            inflight: Arc::new(Mutex::new(Vec::new())),
+            ci_waiters: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             account,
         }
     }
@@ -651,6 +675,24 @@ pub struct QueueStats {
     /// 要「一个会话到底触达了几个账号」,只能从 `request_logs` 按未加盐逻辑会话键重算
     /// (脚本 hopnow.py);三个计数器合起来也替代不了它。
     pub affinity_spill_total: u64,
+    /// 最优控制调度器(worker 启动以来累计,仅观测):选号决策数。
+    pub ci_decisions: u64,
+    /// 其中选中了本线程仍热的号。
+    pub ci_warm: u64,
+    /// 其中线程在任何号上都没有记录(首轮 / 超过记忆时长)而去了陌生号。
+    pub ci_cold_new: u64,
+    /// 其中回到线程跑过、但已过缓存 TTL 的「老家」(仍有约三分之一能命中,见 `cost_index::WARMTH_CURVE`)。
+    pub ci_stale: u64,
+    /// 其中线程在某号上有记录、但比较代价后去了陌生号(老家要等太久 / 限流风险太高)。
+    /// 这是「省不下来的换号」,与旧版的 `affinity_*` 换号计数对照着看。
+    pub ci_cold_move: u64,
+    /// 为等热号(或最优号)睡眠的次数(每次切片 +1,不是每请求 +1)与总毫秒。
+    pub ci_waits: u64,
+    pub ci_wait_ms: u64,
+    /// 等待预算用完仍无可立刻起跑的号、或无候选,退回旧版循环的次数。
+    pub ci_fallbacks: u64,
+    /// 线程热度表当前条目数。
+    pub ci_threads: usize,
 }
 
 /// [`AccountScheduler::sync_accounts`] 的变更统计(日志用)。
@@ -820,6 +862,87 @@ pub struct AccountLease {
     /// 选号时刻的软冷却代际快照。upstream_cut 上报随身携带,代际不符即丢弃
     /// (见 [`CredentialState::epoch`] 与 [`AccountScheduler::report_upstream_cut`])。
     pub cut_epoch: u64,
+    /// 起跑时刻(领到并发许可的时刻)。线程热度与耗时估计用。
+    pub leased_at: Instant,
+    /// 调度钉号键(会话 + 线程),由 [`AccountScheduler::acquire_with_hints`] 填入;
+    /// 收尾时凭它回写热度(见 [`AccountScheduler::note_thread_usage`])。
+    pub pin_key: Option<Arc<str>>,
+    /// 在途登记,Drop 即注销。
+    _inflight: InflightGuard,
+}
+
+/// 在途登记号发号器(进程内单调递增)。
+static INFLIGHT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// 在途登记的 RAII 句柄:lease 持有,Drop 时从该号的在途表里删掉自己。
+/// ⚠️ Drop 只拿在途表自己的锁,**绝不碰 `entries`**(parking_lot 不可重入,而 lease
+/// 可能在持有 `entries` 的代码路径上被丢弃)。
+struct InflightGuard {
+    list: Arc<Mutex<Vec<(u64, Instant)>>>,
+    id: u64,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        let id = self.id;
+        self.list.lock().retain(|(i, _)| *i != id);
+    }
+}
+
+/// 最优控制调度器的等待者登记(RAII):持有期间计入该号的 `ci_waiters`。
+/// 取号 future 被取消(客户端断开)时随之 Drop,计数不会只涨不落。
+struct CiWaiterGuard(Arc<std::sync::atomic::AtomicU32>);
+
+impl CiWaiterGuard {
+    fn new(counter: Arc<std::sync::atomic::AtomicU32>) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for CiWaiterGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// 最优控制调度器的选号提示(调用方按请求算好传入;全 `None`/0 时退化为无热度信息)。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PickHints<'a> {
+    /// 调度钉号键(会话 + 线程)。只要调度器具备能力,两种算法下都会据此维护热度表
+    /// (切换算法时不会一波冷启动),旧版的决策本身不读它。
+    pub pin_key: Option<&'a str>,
+    /// 本请求输入 token 的粗估(兜底;该线程有实测值时取两者较大)。
+    pub input_tokens_est: u64,
+    /// 为等热号最多等到何时(从请求开始算,跨重试不叠加)。`None` = 从本次取号起算 `max_wait`。
+    pub ci_wait_deadline: Option<Instant>,
+}
+
+/// 单个号的合格状态(见 [`AccountScheduler::entry_gate`])。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// 通过全部合格谓词,此刻可选。
+    Ok,
+    /// 429 节流中,剩余时长后自动可选。
+    Paced(Duration),
+    /// 自己的 RPM 窗口打满,剩余时长后腾出一格。
+    Rpm(Duration),
+    /// 429 冷却中(RateLimited、未人工停用),剩余时长后自愈。
+    Cooling(Duration),
+    /// 复活观察期单飞:已有在途请求。
+    ProbationBusy,
+    /// 其余一切不合格(非本组成员 / 不支持本模型 / 其它禁用)。
+    Out,
+}
+
+/// 最优控制调度器一轮选号的结果。
+enum CiPick {
+    /// 已在同一临界区内领到并发许可。
+    Lease(AccountLease),
+    /// 最优的是一个要等的号:睡这么久后重新评估;附该号的等待者计数。
+    Wait(Duration, Arc<std::sync::atomic::AtomicU32>),
+    /// 没有可用候选(或等待预算已尽仍无能立刻起跑的号):本次取号退回旧版循环。
+    Exhausted,
 }
 
 impl AccountLease {
@@ -1015,6 +1138,22 @@ pub struct AccountScheduler {
     /// 状态转换除入队外立刻 detached 写库,把"崩溃丢转换"的窗口从 30s sync
     /// 周期压到毫秒级(对抗审查阻断#4)。
     lifecycle_store: RwLock<Option<Arc<gw_store::SqliteStore>>>,
+    /// 最优控制调度器的**能力**:号型计价分类器。`None` = 本调度器恒走旧版
+    /// (单元测试、cursor/dario worker)。只有生产 kiro worker 构造时经
+    /// [`Self::with_cost_index`] 注入 —— 所以既有调度测试一行不改、行为不变。
+    cost_index: Option<Arc<dyn Fn(&Account) -> PriceClass + Send + Sync>>,
+    /// 最优控制调度器共享状态(线程热度表 / 池级 429 率 / 耗时中位数)。锁序 `entries → ci`,
+    /// 且不与任何号的在途表嵌套。
+    ci: Mutex<ci::CiState>,
+    /// 最优控制调度器观测计数(仅观测,口径见 [`QueueStats`] 同名字段)。
+    ci_decisions: std::sync::atomic::AtomicU64,
+    ci_warm: std::sync::atomic::AtomicU64,
+    ci_cold_new: std::sync::atomic::AtomicU64,
+    ci_stale: std::sync::atomic::AtomicU64,
+    ci_cold_move: std::sync::atomic::AtomicU64,
+    ci_waits: std::sync::atomic::AtomicU64,
+    ci_wait_ms: std::sync::atomic::AtomicU64,
+    ci_fallbacks: std::sync::atomic::AtomicU64,
 }
 
 impl AccountScheduler {
@@ -1052,7 +1191,51 @@ impl AccountScheduler {
             pending_lifecycle: Mutex::new(HashMap::new()),
             suspend_lifecycle_enabled,
             lifecycle_store: RwLock::new(None),
+            cost_index: None,
+            ci: Mutex::new(ci::CiState::new(Instant::now())),
+            ci_decisions: std::sync::atomic::AtomicU64::new(0),
+            ci_warm: std::sync::atomic::AtomicU64::new(0),
+            ci_cold_new: std::sync::atomic::AtomicU64::new(0),
+            ci_stale: std::sync::atomic::AtomicU64::new(0),
+            ci_cold_move: std::sync::atomic::AtomicU64::new(0),
+            ci_waits: std::sync::atomic::AtomicU64::new(0),
+            ci_wait_ms: std::sync::atomic::AtomicU64::new(0),
+            ci_fallbacks: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// 赋予本调度器「最优控制调度器」能力(号型计价分类器)。只在生产 kiro worker 构造时调用;
+    /// 真正生效还要设置 `scheduler_algorithm = cost_index`(默认即是),见 [`Self::cost_index_active`]。
+    pub fn with_cost_index(
+        mut self,
+        classify: impl Fn(&Account) -> PriceClass + Send + Sync + 'static,
+    ) -> Self {
+        self.cost_index = Some(Arc::new(classify));
+        self
+    }
+
+    /// 是否具备最优控制调度能力(具备即维护线程热度表与池级 429 率,与当前算法无关)。
+    pub fn cost_index_capable(&self) -> bool {
+        self.cost_index.is_some()
+    }
+
+    /// 此刻是否在用最优控制调度器(能力 + 设置同时满足)。
+    pub fn cost_index_active(&self) -> bool {
+        self.cost_index.is_some() && self.tuning.read().algorithm == SchedulerAlgorithm::CostIndex
+    }
+
+    /// 实际执行的算法名(`/health` 展示用)。
+    pub fn active_algorithm(&self) -> &'static str {
+        if self.cost_index_active() {
+            SchedulerAlgorithm::CostIndex.as_str()
+        } else {
+            SchedulerAlgorithm::Affinity.as_str()
+        }
+    }
+
+    /// 单请求为等热号的最长等待(调用方据请求开始时刻算绝对截止)。
+    pub fn cost_index_max_wait(&self) -> Duration {
+        self.tuning.read().ci.max_wait
     }
 
     /// 注入即时落库句柄(worker 启动时;见 `lifecycle_store` 字段注释)。
@@ -1312,20 +1495,53 @@ impl AccountScheduler {
         warmup: &WarmupTuning,
         now_unix: i64,
     ) -> bool {
+        Self::entry_gate(e, now, supports, view, warmup, now_unix) == Gate::Ok
+    }
+
+    /// 合格谓词的**唯一实现**:返回该号的合格状态,而不只是真假。
+    ///
+    /// [`Self::entry_ok_ignoring_busy`] = 本函数返回 [`Gate::Ok`],判定顺序与语义和改造前
+    /// 逐字节一致;最优控制调度器额外需要知道「不合格但等一会儿就合格」的号还要等多久
+    /// (节流 / RPM 窗口 / 429 冷却),以便把它们当成「要等的候选」参与比较 ——
+    /// 所以扩展返回值,而不是再写一份谓词(判据漂移的历史教训见上)。
+    fn entry_gate(
+        e: &mut CredentialState,
+        now: Instant,
+        supports: &dyn Fn(&Account) -> bool,
+        view: Option<&GroupView>,
+        warmup: &WarmupTuning,
+        now_unix: i64,
+    ) -> Gate {
         // 非本组成员直接出局(rank 同时用于下面的 RPM 上限口径)。
-        let Some(rank) = rank_of(view, e) else { return false };
+        let Some(rank) = rank_of(view, e) else { return Gate::Out };
+        if e.disabled {
+            // 只有「429 冷却、到期自愈、未被人工停用」这一种禁用对等待有意义;其余一律出局。
+            // supports 仍须满足(与下面同口径,且维持短路顺序:禁用号原本不求值 supports,
+            // 这里只对可能入选的冷却号求值)。
+            return match (e.disabled_reason, e.disabled_until) {
+                (Some(DisabledReason::RateLimited), Some(t))
+                    if !e.config_disabled && t > now && supports(&e.account) =>
+                {
+                    Gate::Cooling(t - now)
+                }
+                _ => Gate::Out,
+            };
+        }
+        if !supports(&e.account) {
+            return Gate::Out;
+        }
         // 429 节流窗口内不选它,但它**没下线** —— 到点即恢复,不需要 sweep。
-        if e.disabled || !supports(&e.account) || e.paced_until.is_some_and(|t| now < t) {
-            return false;
+        if let Some(t) = e.paced_until {
+            if now < t {
+                return Gate::Paced(t - now);
+            }
         }
         // RPM 打满的号本轮不可选。**必须排在上面的判定之后**:先排除掉压根选不中的号,
         // 免得为它们做窗口清理。与 `paced_until` 一样是"没下线、到点自己回来"的软状态,
         // 不进 `/health` 禁用统计、不让整组被判 AllDisabled。
-        if e.rpm_exhausted(
-            now,
-            e.effective_rpm_limit(rank, warmup, now_unix, view.map(|v| v.group.as_str())),
-        ) {
-            return false;
+        let limit = e.effective_rpm_limit(rank, warmup, now_unix, view.map(|v| v.group.as_str()));
+        if e.rpm_exhausted(now, limit) {
+            return Gate::Rpm(e.rpm_wait(now, limit).unwrap_or(RPM_WINDOW));
         }
         // 复活观察期单飞:已有在途请求(许可被拿走)就不再发第二个——
         // 冷却刚过的号若在第一个 403 返回前被塞满并发,复活瞬间就会
@@ -1333,9 +1549,9 @@ impl AccountScheduler {
         if e.probation
             && e.semaphore.available_permits() < e.account.max_concurrency.max(1) as usize
         {
-            return false;
+            return Gate::ProbationBusy;
         }
-        true
+        Gate::Ok
     }
 
     /// 「降层前先等」的判定:若**更高优先层**存在仅因 429 节流而暂不可选的号,返回其中
@@ -1877,6 +2093,243 @@ impl AccountScheduler {
         Some((chosen, reservation))
     }
 
+    /// 最优控制调度器的一轮选号(见 [`super::cost_index`] 的模型说明)。
+    ///
+    /// 全程在**同一个 `entries` 临界区**内完成:合格判定 → 候选快照 → 决策 → 领并发许可
+    /// → `last_selected_at` 与 RPM 预留。许可在锁内领到,所以不存在旧版「选中后 try_lease
+    /// 失败、要退还 RPM 预留」的竞态;RPM 只在许可到手后才记,不会漏记也不用退。
+    ///
+    /// 候选集:
+    /// - 本线程仍热的号(缓存 TTL 内成功服务过)。优先层沿用 `affinity_migrate_up` 的语义:
+    ///   关(生产现状)时热号可以在任意层;开时若更高层有能立刻起跑的号,不保留低层热号;
+    /// - 冷号至多两个:最优先层里指数最低的号(允许等,等价于旧版 tier_hold),以及
+    ///   有空位的最高层里能立刻起跑的号。冷号不从 draining(软冷却)的号里挑,除非全都在
+    ///   draining(与旧版 fail-open 同口径);已热的 draining 号照样可用(旧版亲和也粘着)。
+    fn select_ci(
+        &self,
+        hints: &PickHints<'_>,
+        supports: &dyn Fn(&Account) -> bool,
+        view: Option<&GroupView>,
+        now: Instant,
+        immediate_only: bool,
+    ) -> CiPick {
+        let Some(classify) = self.cost_index.clone() else { return CiPick::Exhausted };
+        let (warmup, p, migrate_up) = {
+            let t = self.tuning.read();
+            (t.warmup.clone(), t.ci, t.affinity_migrate_up)
+        };
+        let now_unix = unix_now();
+        let mut entries = self.entries.lock();
+        Self::heal_cooldowns(&mut entries, now, self.suspend_lifecycle_enabled);
+        let mut state = self.ci.lock();
+        state.maybe_sweep(now, p.cache_ttl);
+        let dmed = state.dmed();
+        let rates = [
+            state.pool_rate(PriceClass::Personal, now),
+            state.pool_rate(PriceClass::Enterprise, now),
+        ];
+        let key = hints.pin_key;
+        let x = key
+            .map_or(0, |k| state.thread_input(k))
+            .max(hints.input_tokens_est);
+
+        struct Row {
+            id: String,
+            cand: ci::Cand,
+            draining: bool,
+            /// 本线程在记忆时长内在该号上跑过(热度 > 0)。
+            touched: bool,
+            /// 且仍在缓存 TTL 内(只用于计数口径)。
+            hot: bool,
+            waiters: Arc<std::sync::atomic::AtomicU32>,
+        }
+        let mut rows: Vec<Row> = Vec::new();
+        for e in entries.values_mut() {
+            let base_wait = match Self::entry_gate(e, now, supports, view, &warmup, now_unix) {
+                Gate::Ok => Duration::ZERO,
+                // 下限 1ms:剩余恰为 0 的边界上仍按「要等」处理,绝不把 RPM 打满的号当成
+                // 能立刻起跑(那会让预留越过上限)。
+                Gate::Paced(d) | Gate::Rpm(d) | Gate::Cooling(d) => {
+                    d.max(Duration::from_millis(1))
+                }
+                Gate::ProbationBusy | Gate::Out => continue,
+            };
+            // entry_gate 非 Out ⇒ 是本组成员。
+            let rank = rank_of(view, e).unwrap_or(e.default_rank);
+            let draining = match e.drain_until {
+                Some(d) if now < d => true,
+                Some(_) => {
+                    e.drain_until = None;
+                    e.cuts.clear();
+                    tracing::info!(account = %e.account.account_id, "软冷却到期,退出 draining");
+                    false
+                }
+                None => false,
+            };
+            let class = classify(&e.account);
+            let mut wait = base_wait;
+            // 个人号起跑间隔:同一瞬间起跑多个请求易 429(2026-09-30 受控实验)。
+            if class == PriceClass::Personal && !p.start_spacing.is_zero() {
+                if let Some(t) = e.last_start_at {
+                    wait = wait.max((t + p.start_spacing).saturating_duration_since(now));
+                }
+            }
+            let waiters_ahead = e.ci_waiters.load(std::sync::atomic::Ordering::Relaxed);
+            let free = e.semaphore.available_permits();
+            // 在途数由并发位直接算;只有号满载时才去读在途表估「多久轮到」(本段在全局
+            // entries 临界区内,不为空闲号额外加锁、分配)。
+            let inflight_n = (e.account.max_concurrency.max(1) as usize).saturating_sub(free);
+            if free == 0 {
+                if waiters_ahead >= ci::MAX_WAITERS_PER_ACCOUNT {
+                    continue;
+                }
+                let elapsed: Vec<Duration> = e
+                    .inflight
+                    .lock()
+                    .iter()
+                    .map(|(_, t)| now.saturating_duration_since(*t))
+                    .collect();
+                wait = wait.max(ci::busy_wait(&elapsed, waiters_ahead, dmed));
+            }
+            let age = key.and_then(|k| state.touch_age(k, &e.account.account_id, now, p.cache_ttl));
+            let warmth = age.map_or(0.0, |a| ci::warmth(a, p.cache_ttl));
+            let hot = age.is_some_and(|a| a <= p.cache_ttl);
+            // draining(软冷却)号只留住仍在 TTL 内的热线程;过了 TTL 的老家按陌生号对待 ——
+            // 否则记忆时长(30 分钟)几乎覆盖整个软冷却期,它照样被老线程拉回来接活(代码评审)。
+            let touched = warmth > 0.0 && (hot || !draining);
+            let pool = rates[if class == PriceClass::Personal { 0 } else { 1 }];
+            rows.push(Row {
+                id: e.account.account_id.clone(),
+                cand: ci::Cand {
+                    rank,
+                    class,
+                    warmth,
+                    wait,
+                    p429: ci::p429(pool, e.last_429_at.map(|t| now.saturating_duration_since(t))),
+                    active: state.active_threads(&e.account.account_id),
+                    inflight: inflight_n,
+                    last_selected: e.last_selected_at,
+                },
+                draining,
+                touched,
+                hot,
+                waiters: e.ci_waiters.clone(),
+            });
+        }
+        if rows.is_empty() {
+            return CiPick::Exhausted;
+        }
+
+        // 冷候选池:本线程没跑过的、不 draining 的号;全都 draining 才 fail-open。
+        let cold_pool: Vec<usize> = {
+            let normal: Vec<usize> = (0..rows.len())
+                .filter(|&i| !rows[i].touched && !rows[i].draining)
+                .collect();
+            if normal.is_empty() {
+                (0..rows.len()).filter(|&i| !rows[i].touched).collect()
+            } else {
+                normal
+            }
+        };
+        let top_any = cold_pool.iter().map(|&i| rows[i].cand.rank).min();
+        let top_now = cold_pool
+            .iter()
+            .filter(|&&i| rows[i].cand.wait.is_zero())
+            .map(|&i| rows[i].cand.rank)
+            .min();
+        // 子集里按指数取最优(与最终决策同一套排序)。
+        let best_in = |idx: Vec<usize>| -> Option<usize> {
+            let cands: Vec<ci::Cand> = idx.iter().map(|&i| rows[i].cand.clone()).collect();
+            match ci::decide(&cands, x, &p, false) {
+                ci::Decision::Go(j) | ci::Decision::Wait(j, _) => Some(idx[j]),
+                ci::Decision::Nothing => None,
+            }
+        };
+        // 本线程跑过的号(含已过 TTL 但还在记忆时长内的「老家」)全部进候选,由热度定价。
+        let mut picks: Vec<usize> = (0..rows.len())
+            .filter(|&i| {
+                rows[i].touched
+                    && !(migrate_up && top_now.is_some_and(|t| rows[i].cand.rank > t))
+            })
+            .collect();
+        let any_touched = rows.iter().any(|r| r.touched);
+        if let Some(t) = top_any {
+            if let Some(i) = best_in(cold_pool.iter().copied().filter(|&i| rows[i].cand.rank == t).collect()) {
+                picks.push(i);
+            }
+        }
+        if let Some(t) = top_now {
+            let now_ids = cold_pool
+                .iter()
+                .copied()
+                .filter(|&i| rows[i].cand.rank == t && rows[i].cand.wait.is_zero())
+                .collect();
+            if let Some(i) = best_in(now_ids) {
+                if !picks.contains(&i) {
+                    picks.push(i);
+                }
+            }
+        }
+        let cands: Vec<ci::Cand> = picks.iter().map(|&i| rows[i].cand.clone()).collect();
+        match ci::decide(&cands, x, &p, immediate_only) {
+            ci::Decision::Go(j) => {
+                let i = picks[j];
+                let chosen = rows[i].cand.clone();
+                let (chosen_touched, chosen_hot) = (rows[i].touched, rows[i].hot);
+                let id = rows[i].id.clone();
+                let Some(lease) = Self::lease_locked(&mut entries, &id, now) else {
+                    // 理论不可达(锁内看到空位且无人能在锁外领许可);保守地短等后重评。
+                    return CiPick::Wait(MIN_TIER_HOLD, rows[i].waiters.clone());
+                };
+                if let Some(e) = entries.get_mut(&id) {
+                    // 与旧版 select_id 同口径:选中即更新 LRU,并在同一临界区预留 RPM 名额。
+                    e.last_selected_at = Some(now);
+                    let rank = rank_of(view, e).unwrap_or(e.default_rank);
+                    let limit = e.effective_rpm_limit(
+                        rank,
+                        &warmup,
+                        now_unix,
+                        view.map(|v| v.group.as_str()),
+                    );
+                    e.rpm_note_selected(now, limit);
+                }
+                state.note_pool(chosen.class, now, true, false);
+                if !chosen_touched {
+                    state.note_new_home(&id);
+                }
+                use std::sync::atomic::Ordering::Relaxed;
+                self.ci_decisions.fetch_add(1, Relaxed);
+                let kind = if chosen_hot {
+                    self.ci_warm.fetch_add(1, Relaxed);
+                    "warm"
+                } else if chosen_touched {
+                    self.ci_stale.fetch_add(1, Relaxed);
+                    "stale"
+                } else if any_touched {
+                    self.ci_cold_move.fetch_add(1, Relaxed);
+                    "cold_move"
+                } else {
+                    self.ci_cold_new.fetch_add(1, Relaxed);
+                    "cold_new"
+                };
+                tracing::debug!(
+                    account = %id,
+                    thread = key.unwrap_or(""),
+                    kind,
+                    x,
+                    warmth = chosen.warmth,
+                    index = ci::index(&chosen, x, &p),
+                    p429 = chosen.p429,
+                    candidates = cands.len(),
+                    "最优控制调度器选号"
+                );
+                CiPick::Lease(lease)
+            }
+            ci::Decision::Wait(j, d) => CiPick::Wait(d, rows[picks[j]].waiters.clone()),
+            ci::Decision::Nothing => CiPick::Exhausted,
+        }
+    }
+
     /// 按**句柄**退还一次 RPM 预留(选号成功但没拿到 permit,故未发出上游调用)。
     /// 句柄由 `select_id` 随选中 id 一同返回;`None` = 当时未记账(不限速),no-op。
     /// 句柄制让退还精确命中自己的预留,不会因并发下 deque 尾部错位而退掉别人的
@@ -1932,24 +2385,42 @@ impl AccountScheduler {
         // 全程持 entries 锁:**观察期单飞的「检查 + 认领」必须在同一临界区**——
         // 锁外先检查后抢 permit 的话,两个并发请求都看到空位、都抢到 permit,
         // 单飞被突破(对抗审查阻断#1)。try_acquire_owned 非阻塞,持锁无 await 成本。
-        let entries = self.entries.lock();
-        let e = entries.get(id)?;
+        let now = Instant::now();
+        let mut entries = self.entries.lock();
+        let lease = Self::lease_locked(&mut entries, id, now)?;
+        // 具备能力时,旧版起跑也计入池级 429 率的分母(锁序 entries → ci)。
+        if let Some(classify) = &self.cost_index {
+            self.ci.lock().note_pool(classify(&lease.account), now, true, false);
+        }
+        Some(lease)
+    }
+
+    /// 在**已持有 `entries` 锁**的前提下认领并发许可、登记在途。
+    /// [`Self::try_lease`] 与最优控制调度器共用,单飞检查与认领因此总在同一临界区。
+    fn lease_locked(
+        entries: &mut HashMap<String, CredentialState>,
+        id: &str,
+        now: Instant,
+    ) -> Option<AccountLease> {
+        let e = entries.get_mut(id)?;
         if e.probation
             && e.semaphore.available_permits() < e.account.max_concurrency.max(1) as usize
         {
             return None;
         }
-        let suspend_gen = e.suspend_gen;
-        let cut_epoch = e.epoch;
-        match e.semaphore.clone().try_acquire_owned() {
-            Ok(permit) => Some(AccountLease {
-                account: e.account.clone(),
-                _permit: permit,
-                suspend_gen,
-                cut_epoch,
-            }),
-            Err(_) => None,
-        }
+        let permit = e.semaphore.clone().try_acquire_owned().ok()?;
+        e.last_start_at = Some(now);
+        let seq = INFLIGHT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        e.inflight.lock().push((seq, now));
+        Some(AccountLease {
+            account: e.account.clone(),
+            _permit: permit,
+            suspend_gen: e.suspend_gen,
+            cut_epoch: e.epoch,
+            leased_at: now,
+            pin_key: None,
+            _inflight: InflightGuard { list: e.inflight.clone(), id: seq },
+        })
     }
 
     /// 选号 + 取并发许可,**无模型过滤**(等价 `acquire_where(_, |_| true)`)。
@@ -2030,6 +2501,37 @@ impl AccountScheduler {
     where
         F: Fn(&Account) -> bool,
     {
+        self.acquire_with_hints(
+            session_key,
+            &PickHints::default(),
+            supports,
+            view,
+            allow_tier_hold,
+            deadline,
+        )
+        .await
+    }
+
+    /// 同 [`Self::acquire_in_group_until`],外加最优控制调度器的选号提示
+    /// (线程钉号键、输入量粗估、等待截止)。worker 主链路走这里。
+    ///
+    /// - 能力 + 设置都指向 `cost_index` 时:每轮先走 [`Self::select_ci`](代价指数选号,
+    ///   可能决定「等」);等待预算用完仍没有能立刻起跑的号、或组内压根没有候选时,
+    ///   **本次取号整段退回旧版循环**(由它给出正确的等待与错误口径)。
+    /// - 否则:与改造前的旧版循环逐字节一致;`session_key` 仍是旧版亲和键,
+    ///   `hints.pin_key` 只用来在成功后维护热度表。
+    pub async fn acquire_with_hints<F>(
+        &self,
+        session_key: Option<&str>,
+        hints: &PickHints<'_>,
+        supports: F,
+        view: Option<&GroupView>,
+        allow_tier_hold: bool,
+        deadline: Option<Instant>,
+    ) -> Result<AccountLease, AcquireError>
+    where
+        F: Fn(&Account) -> bool,
+    {
         let total = self.total();
         if total == 0 {
             return Err(AcquireError::Empty);
@@ -2045,6 +2547,14 @@ impl AccountScheduler {
             (t.queue_wait, t.tier_hold, t.rpm_wait, t.affinity_hold)
         };
         let started = Instant::now();
+        // ── 最优控制调度器 ──
+        // 一次取号只用一种算法:进循环前快照,中途热切换不来回翻。
+        let mut ci_mode = self.cost_index_active();
+        let ci_deadline = hints
+            .ci_wait_deadline
+            .unwrap_or_else(|| started + self.tuning.read().ci.max_wait);
+        // 当前登记的等待者名额(RAII;下一轮重新登记时旧的随赋值 Drop)。
+        let mut _ci_waiter: Option<CiWaiterGuard> = None;
         // 亲和粘性用**独立时钟**(对抗评审 [中]):与 `started` 共用会让
         // tier_hold / queue_wait / rpm_wait 先花掉的时间把粘性预算提前吃光,
         // 于是「为 busy primary 等多久」取决于此前走过哪些分支,而不是配置值。
@@ -2073,6 +2583,39 @@ impl AccountScheduler {
             // `RETRY_DEADLINE`(180s)撑爆,客户拿到的是比报错更难查的中断。
             // `None` = 不设截止 → `Duration::MAX`,不产生任何额外约束。
             let budget_cap = deadline.map_or(Duration::MAX, |d| d.saturating_duration_since(now));
+
+            if ci_mode {
+                // 等待预算(从请求开始算)用完、或请求级截止将至:只在能立刻起跑的号里挑。
+                let immediate_only = now >= ci_deadline || budget_cap < MIN_TIER_HOLD;
+                match self.select_ci(hints, &supports, view, now, immediate_only) {
+                    CiPick::Lease(mut lease) => {
+                        lease.pin_key = hints.pin_key.map(Arc::from);
+                        return Ok(lease);
+                    }
+                    CiPick::Wait(d, waiters) => {
+                        // 登记为该号的等待者(后来者据此把自己排在后面),睡完回来重新评估。
+                        // 与其它等待分支一样**不消耗 `attempts`**;睡眠有下限保证推进,
+                        // 由 `ci_deadline` / 请求级截止保证终止。
+                        _ci_waiter = Some(CiWaiterGuard::new(waiters));
+                        let d = d
+                            .max(MIN_TIER_HOLD)
+                            .min(budget_cap)
+                            .min(deadline_left(deadline));
+                        self.ci_waits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.ci_wait_ms
+                            .fetch_add(d.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+                        tokio::time::sleep(d).await;
+                        continue;
+                    }
+                    CiPick::Exhausted => {
+                        // 退回旧版循环,**不能只复用它的「无候选」分支**:新模式下 `busy`
+                        // 恒空,一个只是饱和的池会被那条分支误报成 AllDisabled(503)。
+                        ci_mode = false;
+                        _ci_waiter = None;
+                        self.ci_fallbacks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
 
             // ── 会话亲和粘性:primary 仅因并发满时等它,而不是把会话改钉到别的号 ──
             //
@@ -2452,7 +2995,10 @@ impl AccountScheduler {
             };
 
             match self.try_lease(&id) {
-                Some(lease) => return Ok(lease),
+                Some(mut lease) => {
+                    lease.pin_key = hints.pin_key.map(Arc::from);
+                    return Ok(lease);
+                }
                 None => {
                     // 并发满:标 busy,换号重试。选号时预留的 RPM 名额要**退还** ——
                     // 这一轮没有发出任何上游调用,不退会让健康号被虚假限流近 60 秒。
@@ -2503,6 +3049,16 @@ impl AccountScheduler {
             affinity_spill_total: self
                 .affinity_spill_total
                 .load(std::sync::atomic::Ordering::Relaxed),
+            ci_decisions: self.ci_decisions.load(std::sync::atomic::Ordering::Relaxed),
+            ci_warm: self.ci_warm.load(std::sync::atomic::Ordering::Relaxed),
+            ci_cold_new: self.ci_cold_new.load(std::sync::atomic::Ordering::Relaxed),
+            ci_stale: self.ci_stale.load(std::sync::atomic::Ordering::Relaxed),
+            ci_cold_move: self.ci_cold_move.load(std::sync::atomic::Ordering::Relaxed),
+            ci_waits: self.ci_waits.load(std::sync::atomic::Ordering::Relaxed),
+            ci_wait_ms: self.ci_wait_ms.load(std::sync::atomic::Ordering::Relaxed),
+            ci_fallbacks: self.ci_fallbacks.load(std::sync::atomic::Ordering::Relaxed),
+            // 锁序 entries → ci(上面已持 entries)。
+            ci_threads: self.ci.lock().threads(),
             ..Default::default()
         };
         let now = Instant::now();
@@ -2990,6 +3546,28 @@ impl AccountScheduler {
         true
     }
 
+    /// 一次**成功出首包**的请求收尾时回写:该线程在这个号上变热(时刻取起跑时刻)、
+    /// 记下实测输入 token(下次估冷热差价用);完整成功时更新耗时中位数估计。
+    /// 失败 / 429 的尝试**不要**调本方法 —— 它们没有填上游缓存,记热会让后续请求
+    /// 为一个其实是冷的号白等。不具备能力的调度器上是空操作。
+    pub fn note_thread_usage(&self, lease: &AccountLease, input_tokens: Option<u64>, complete: bool) {
+        if self.cost_index.is_none() {
+            return;
+        }
+        let ttl = self.tuning.read().ci.cache_ttl;
+        let now = Instant::now();
+        let mut state = self.ci.lock();
+        // 这里也要清扫:热度表在两种算法下都写,而 select_ci 只在新算法生效时才跑。
+        // 只在那里清扫的话,切到旧版后热度表只增不删(每个会话线程一条),worker 内存无界增长。
+        state.maybe_sweep(now, ttl);
+        if let Some(key) = lease.pin_key.as_deref() {
+            state.touch(key, lease.account_id(), lease.leased_at, input_tokens, now);
+        }
+        if complete {
+            state.note_duration(now.saturating_duration_since(lease.leased_at));
+        }
+    }
+
     /// 人工救号(admin reset):清运行时禁用/冷却/全部计数,立即回到选号池。
     /// 配置层禁用(admin 开关 disabled=true)**不**在此解除——那是显式运营意图,
     /// 走 PATCH disabled=false。返回是否找到该账号。
@@ -3005,6 +3583,7 @@ impl AccountScheduler {
         // 429 节流窗口与 strikes 也要清 —— "救号"就该让它立刻可用。
         e.paced_until = None;
         e.rate_limit_strikes = 0;
+        e.last_429_at = None;
         // RPM 滑动窗口同样清空(对抗审查 [中]):不清的话 admin reset 返回成功、
         // 面板显示已启用,号却仍被自己的 RPM 闸挡在选号池外直到旧 hit 自然过期,
         // 运维完全看不出原因。
@@ -3232,23 +3811,46 @@ impl AccountScheduler {
         match kind {
             UpstreamErrorKind::RateLimited => {
                 e.rate_limit_strikes = e.rate_limit_strikes.saturating_add(1);
+                // 具备最优控制能力就记(与当前算法无关,切换算法时估计不从零开始):
+                // 本号最近一次 429 + 池级 429 率(锁序 entries → ci)。
+                let class = self.cost_index.as_ref().map(|f| f(&e.account));
+                if let Some(class) = class {
+                    e.last_429_at = Some(now);
+                    self.ci.lock().note_pool(class, now, false, true);
+                }
+                // 排队号(企业号形态,不会被封)的 429 口径**与算法无关**,只认
+                // rate_limit_pace_*:生产熔断阈值 0 = 永不因 429 下线。2026-09-30 曾让它在新算法下
+                // 改用 cost_index_pace_*(默认熔断 3 次),企业号连撞 3 次就进了冷却,已回退修正。
+                // cost_index_pace_* 只管个人号:默认**不**节流(历史上定频探测 22 分钟送走 5 个号),
+                // 开了 cost_index_pace_personal 才节流;冷却也不再导致永久改钉 —— 冷却中的热号
+                // 作为「要等的候选」参与比较(见 select_ci)。
+                let ci_active = class.is_some() && tuning.algorithm == SchedulerAlgorithm::CostIndex;
+                let personal_paced = !queue_enabled(&e.account)
+                    && ci_active
+                    && tuning.ci.pace_personal
+                    && class == Some(PriceClass::Personal);
+                let (pace, pace_max_strikes) = if personal_paced {
+                    (tuning.ci.pace, tuning.ci.pace_max_strikes)
+                } else {
+                    (tuning.rate_limit_pace, tuning.rate_limit_pace_max_strikes)
+                };
+                let pace_eligible = queue_enabled(&e.account) || personal_paced;
                 // 开了排队的号:429 是**跨租户竞争**,不是我方过载 —— 把号整个拉出轮转
                 // 只会让请求转去烧别的号(而企业号往往正握着大部分剩余额度)。
                 // 改成节流:号不下线,只是 pace 毫秒内不被选中,到点继续抢。
                 // 熔断:连续撞太多次说明上游是真把它限死了,退回二值冷却别硬撞。
                 // 熔断阈值 0 = 永不退回冷却。429 只是竞争,真正的下线信号是
                 // 403 TEMPORARILY_SUSPENDED(走 TemporarilyBlocked 分支,1h 冷却)。
-                let paced = queue_enabled(&e.account)
-                    && !tuning.rate_limit_pace.is_zero()
-                    && (tuning.rate_limit_pace_max_strikes == 0
-                        || e.rate_limit_strikes <= tuning.rate_limit_pace_max_strikes);
+                let paced = pace_eligible
+                    && !pace.is_zero()
+                    && (pace_max_strikes == 0 || e.rate_limit_strikes <= pace_max_strikes);
                 if paced {
                     self.paced_total
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    e.paced_until = Some(now + tuning.rate_limit_pace);
+                    e.paced_until = Some(now + pace);
                     tracing::debug!(
                         account = %id, strikes = e.rate_limit_strikes,
-                        "命中限流,节流 {}ms(号不下线)", tuning.rate_limit_pace.as_millis(),
+                        "命中限流,节流 {}ms(号不下线)", pace.as_millis(),
                     );
                 } else {
                     e.disabled = true;
@@ -6646,5 +7248,488 @@ mod tests {
         drop(l1);
         let l2 = s.acquire(None).await.unwrap();
         assert_eq!(l2.account_id(), "b", "RPM 打满的 draining 号不得被 fail-open 选中");
+    }
+
+    // ================= 最优控制调度器(代价指数) =================
+
+    /// 测试用分类器:id 以 `ent` 开头的算企业号。
+    fn ci_class(a: &Account) -> PriceClass {
+        if a.account_id.starts_with("ent") {
+            PriceClass::Enterprise
+        } else {
+            PriceClass::Personal
+        }
+    }
+
+    /// 具备能力、算法 = cost_index 的调度器。默认关掉起跑间隔,需要它的用例自己开。
+    fn ci_sched_with(accounts: Vec<Arc<Account>>, tweak: impl FnOnce(&mut SchedulerConfig)) -> AccountScheduler {
+        let mut cfg = SchedulerConfig {
+            cost_index_start_spacing_ms: 0,
+            ..SchedulerConfig::default()
+        };
+        tweak(&mut cfg);
+        AccountScheduler::new(accounts, &cfg).with_cost_index(ci_class)
+    }
+
+    fn ci_sched(accounts: Vec<Arc<Account>>) -> AccountScheduler {
+        ci_sched_with(accounts, |_| {})
+    }
+
+    fn hints(pin: &str, x: u64) -> PickHints<'_> {
+        PickHints { pin_key: Some(pin), input_tokens_est: x, ci_wait_deadline: None }
+    }
+
+    /// 把耗时中位数估计压到约 1 秒(让「并发满要等多久」可预期)。
+    fn ci_fast_dmed(s: &AccountScheduler) {
+        let mut st = s.ci.lock();
+        for _ in 0..200 {
+            st.note_duration(Duration::from_secs(1));
+        }
+    }
+
+    fn ci_pick(s: &AccountScheduler, h: &PickHints<'_>, immediate_only: bool) -> CiPick {
+        s.select_ci(h, &|_| true, None, Instant::now(), immediate_only)
+    }
+
+    #[test]
+    fn ci_plain_new_is_legacy_and_capability_is_opt_in() {
+        let legacy = sched(vec![acct("a", 1, None)]);
+        assert!(!legacy.cost_index_capable());
+        assert!(!legacy.cost_index_active(), "默认配置是 cost_index,但没有能力就恒走旧版");
+        assert_eq!(legacy.active_algorithm(), "affinity");
+        let s = ci_sched(vec![acct("a", 1, None)]);
+        assert!(s.cost_index_active());
+        assert_eq!(s.active_algorithm(), "cost_index");
+        // 热切换回旧版、再切回来。
+        s.update_tuning(&SchedulerConfig {
+            scheduler_algorithm: SchedulerAlgorithm::Affinity,
+            ..SchedulerConfig::default()
+        });
+        assert!(!s.cost_index_active());
+        assert!(s.cost_index_capable(), "切到旧版不丢能力(热度表照常维护)");
+        s.update_tuning(&SchedulerConfig::default());
+        assert!(s.cost_index_active());
+    }
+
+    #[tokio::test]
+    async fn ci_warm_thread_sticks_and_new_thread_takes_top_tier() {
+        let s = ci_sched(vec![acct("a", 2, Some(0)), acct("b", 2, Some(0)), acct("c", 2, Some(100))]);
+        let l1 = s.acquire_with_hints(None, &hints("t1", 100_000), |_| true, None, true, None).await.unwrap();
+        let first = l1.account_id().to_string();
+        assert_ne!(first, "c", "冷号只从最优先层挑");
+        assert_eq!(l1.pin_key.as_deref(), Some("t1"));
+        s.note_thread_usage(&l1, Some(100_000), true);
+        drop(l1);
+        // 同线程回到热号(即便另一个同层号更「久未用」)。
+        for _ in 0..3 {
+            let l = s.acquire_with_hints(None, &hints("t1", 100_000), |_| true, None, true, None).await.unwrap();
+            assert_eq!(l.account_id(), first, "热线程应粘在原号");
+            s.note_thread_usage(&l, Some(110_000), true);
+        }
+        // 新线程去同层另一个号(LRU)。
+        let l2 = s.acquire_with_hints(None, &hints("t2", 100_000), |_| true, None, true, None).await.unwrap();
+        assert_ne!(l2.account_id(), first);
+        assert_ne!(l2.account_id(), "c");
+        let st = s.queue_stats();
+        assert_eq!(st.ci_decisions, 5);
+        assert_eq!(st.ci_warm, 3);
+        assert_eq!(st.ci_cold_new, 2);
+        assert_eq!(st.ci_cold_move, 0);
+    }
+
+    #[test]
+    fn ci_busy_warm_account_big_context_waits_small_context_moves() {
+        let s = ci_sched(vec![acct("a", 1, None), acct("b", 1, None)]);
+        ci_fast_dmed(&s);
+        let held = s.try_lease("a").unwrap(); // a 的唯一并发位被占着
+        {
+            let now = Instant::now();
+            s.ci.lock().touch("t1", "a", now, None, now);
+        }
+        // 40 万上下文:冷启动多花约 3.4 积分,远大于等约 1 秒 → 等热号。
+        match ci_pick(&s, &hints("t1", 400_000), false) {
+            CiPick::Wait(d, _) => assert!(d <= ci::WAIT_SLICE && !d.is_zero()),
+            _ => panic!("大上下文应等热号"),
+        }
+        // 3 万上下文:冷启动只多花约 0.26 积分 → 直接去空闲的冷号。
+        match ci_pick(&s, &hints("t1", 30_000), false) {
+            CiPick::Lease(l) => assert_eq!(l.account_id(), "b"),
+            _ => panic!("小上下文应立刻换冷号"),
+        }
+        assert_eq!(s.queue_stats().ci_cold_move, 1, "有热号仍换冷号计入 cold_move");
+        drop(held);
+    }
+
+    /// 回归(2026-10-03 生产):线程过了缓存 TTL 就被当成新线程,平局规则(最久未选)反而
+    /// 避开它刚用过的号。现在过了 TTL 仍回「老家」(热度约 0.2–0.58),并计入 ci_stale。
+    #[test]
+    fn ci_stale_thread_returns_home_instead_of_least_recently_used() {
+        let s = ci_sched(vec![acct("a", 2, None), acct("b", 2, None)]);
+        {
+            let now = Instant::now();
+            s.ci.lock().touch("t1", "a", now, Some(200_000), now);
+            s.ci.lock().age_for_test(Duration::from_secs(400));
+            // a 刚被别的线程选过,b 从没被选过:旧逻辑会按 LRU 去 b。
+            s.entries.lock().get_mut("a").unwrap().last_selected_at = Some(now);
+        }
+        let CiPick::Lease(l) = ci_pick(&s, &hints("t1", 200_000), false) else { panic!("应能立刻领号") };
+        assert_eq!(l.account_id(), "a", "过了 TTL 仍应回原号");
+        let st = s.queue_stats();
+        assert_eq!((st.ci_stale, st.ci_warm, st.ci_cold_new, st.ci_cold_move), (1, 0, 0, 0));
+    }
+
+    /// 主号满时,优先去本线程近期跑过的号(相当于旧版的固定伙伴),而不是再挑一个陌生号。
+    #[test]
+    fn ci_overflow_prefers_recent_partner_over_fresh_account() {
+        let s = ci_sched(vec![acct("a", 1, None), acct("b", 1, None), acct("c", 1, None)]);
+        ci_fast_dmed(&s);
+        let held = s.try_lease("a").unwrap();
+        {
+            let now = Instant::now();
+            let mut st = s.ci.lock();
+            st.touch("t1", "b", now - Duration::from_secs(100), None, now);
+            st.touch("t1", "a", now, None, now);
+        }
+        // c 从没被选过(LRU 最优先),但 b 是本线程 100 秒前溢出过的伙伴。
+        let CiPick::Lease(l) = ci_pick(&s, &hints("t1", 200_000), false) else { panic!("应能立刻领号") };
+        assert_eq!(l.account_id(), "b");
+        drop(held);
+    }
+
+    /// 新线程在代价打平的陌生号之间,先挑近期挂着的活跃线程少的号。
+    #[test]
+    fn ci_new_threads_go_to_accounts_with_fewer_active_threads() {
+        let s = ci_sched(vec![acct("a", 4, None), acct("b", 4, None), acct("c", 4, None)]);
+        {
+            let now = Instant::now();
+            let mut st = s.ci.lock();
+            for (t, a) in [("h1", "a"), ("h2", "a"), ("h3", "b")] {
+                st.touch(t, a, now, None, now);
+            }
+            st.age_for_test(Duration::from_secs(31));
+            st.maybe_sweep(Instant::now(), Duration::from_secs(300));
+        }
+        // 让 c 看起来「刚被选过」:旧逻辑按 LRU 会避开它。
+        s.entries.lock().get_mut("c").unwrap().last_selected_at = Some(Instant::now());
+        let CiPick::Lease(l1) = ci_pick(&s, &hints("n1", 50_000), false) else { panic!() };
+        assert_eq!(l1.account_id(), "c", "c 没有活跃线程");
+        // c 已计入新线程(1),与 b 打平;c 还有在途,所以下一个新线程去 b。
+        let CiPick::Lease(l2) = ci_pick(&s, &hints("n2", 50_000), false) else { panic!() };
+        assert_eq!(l2.account_id(), "b");
+        drop((l1, l2));
+    }
+
+    #[tokio::test]
+    async fn ci_wait_then_go_when_permit_frees() {
+        let s = Arc::new(ci_sched(vec![acct("a", 1, None), acct("b", 1, None)]));
+        ci_fast_dmed(&s);
+        let held = s.try_lease("a").unwrap();
+        {
+            let now = Instant::now();
+            s.ci.lock().touch("t1", "a", now, None, now);
+        }
+        let s2 = s.clone();
+        let waiter = tokio::spawn(async move {
+            s2.acquire_with_hints(None, &hints("t1", 2_000_000), |_| true, None, true, None)
+                .await
+                .map(|l| l.account_id().to_string())
+        });
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        drop(held);
+        let got = tokio::time::timeout(Duration::from_secs(5), waiter).await.unwrap().unwrap().unwrap();
+        assert_eq!(got, "a", "热号腾出位子后应回到热号");
+        assert!(s.queue_stats().ci_waits >= 1);
+    }
+
+    #[tokio::test]
+    async fn ci_saturated_pool_falls_back_to_legacy_not_all_disabled() {
+        // 回归(规划审查 B):新模式下 busy 恒空,若只复用旧版「无候选」分支会把饱和池误报成
+        // AllDisabled(503)。必须整段退回旧版循环,报 AllBusy(429)。
+        let s = ci_sched(vec![acct("a", 1, None)]);
+        let _held = s.try_lease("a").unwrap();
+        let h = PickHints {
+            pin_key: Some("t1"),
+            input_tokens_est: 10_000,
+            ci_wait_deadline: Some(Instant::now()),
+        };
+        let r = s
+            .acquire_with_hints(None, &h, |_| true, None, true, Some(Instant::now() + Duration::from_secs(3)))
+            .await;
+        assert_eq!(r.err(), Some(AcquireError::AllBusy));
+        assert_eq!(s.queue_stats().ci_fallbacks, 1);
+    }
+
+    #[tokio::test]
+    async fn ci_group_and_model_errors_unchanged() {
+        let s = ci_sched(vec![acct("a", 1, None)]);
+        let r = s.acquire_with_hints(None, &hints("t", 1), |_| false, None, true, None).await;
+        assert_eq!(r.err(), Some(AcquireError::NoModelSupport));
+        let v = view(&[("zzz", 0)]);
+        let r = s.acquire_with_hints(None, &hints("t", 1), |_| true, Some(&v), true, None).await;
+        assert_eq!(r.err(), Some(AcquireError::GroupEmpty));
+    }
+
+    #[test]
+    fn ci_429_paces_queue_accounts_and_cools_personal_by_default() {
+        // 排队号的节流参数是 rate_limit_pace_*(与生产一致:500ms、不熔断)。
+        let s = ci_sched_with(vec![qacct("q", 1), acct("p", 1, None)], |c| c.rate_limit_pace_ms = 500);
+        s.report_failure("q", UpstreamErrorKind::RateLimited);
+        s.report_failure("p", UpstreamErrorKind::RateLimited);
+        {
+            let e = s.entries.lock();
+            let q = &e["q"];
+            assert!(!q.disabled && q.paced_until.is_some(), "排队号只节流不下线");
+            assert!(q.last_429_at.is_some());
+            let p = &e["p"];
+            assert!(p.disabled && p.disabled_reason == Some(DisabledReason::RateLimited), "个人号默认照旧冷却");
+            assert!(p.last_429_at.is_some());
+        }
+        // 开了 pace_personal:个人号也只节流;连续超过熔断次数才冷却。
+        let s = ci_sched_with(vec![acct("p", 1, None)], |c| {
+            c.cost_index_pace_personal = true;
+            c.cost_index_pace_max_strikes = 2;
+        });
+        s.report_failure("p", UpstreamErrorKind::RateLimited);
+        assert!(!s.entries.lock()["p"].disabled);
+        s.entries.lock().get_mut("p").unwrap().paced_until = None;
+        s.report_failure("p", UpstreamErrorKind::RateLimited);
+        assert!(!s.entries.lock()["p"].disabled, "第 2 次仍在熔断阈值内");
+        s.entries.lock().get_mut("p").unwrap().paced_until = None;
+        s.report_failure("p", UpstreamErrorKind::RateLimited);
+        assert!(s.entries.lock()["p"].disabled, "第 3 次越过熔断阈值 → 冷却");
+        // reset 清掉 last_429_at。
+        assert!(s.reset_account("p"));
+        assert!(s.entries.lock()["p"].last_429_at.is_none());
+    }
+
+    /// 回归(2026-09-30 上线事故):新算法下排队号曾改用 `cost_index_pace_*`(默认熔断 3 次),
+    /// 生产 `rate_limit_pace_max_strikes=0`(排队号永不因 429 下线)被绕过,企业号连撞 3 次
+    /// 就进了限流冷却。排队号的 429 口径必须与算法无关,只认 `rate_limit_pace_*`。
+    #[test]
+    fn ci_queue_account_429_follows_legacy_pace_settings_not_ci_knobs() {
+        let s = ci_sched_with(vec![qacct("q", 1)], |c| {
+            c.rate_limit_pace_ms = 500;
+            c.rate_limit_pace_max_strikes = 0;
+            c.cost_index_pace_ms = 1000;
+            c.cost_index_pace_max_strikes = 3;
+        });
+        assert!(s.cost_index_active());
+        for i in 1..=50 {
+            s.report_failure("q", UpstreamErrorKind::RateLimited);
+            let e = s.entries.lock();
+            assert!(!e["q"].disabled, "第 {i} 次 429:排队号不得下线");
+            let left = e["q"].paced_until.unwrap().saturating_duration_since(Instant::now());
+            assert!(left <= Duration::from_millis(500), "节流时长用 rate_limit_pace_ms");
+        }
+        // rate_limit_pace_ms=0(旧版默认):两种算法下排队号都走二值冷却,逐字节一致。
+        let s = ci_sched(vec![qacct("q", 1)]);
+        s.report_failure("q", UpstreamErrorKind::RateLimited);
+        assert!(s.entries.lock()["q"].disabled, "pace=0 时新旧算法一致:冷却");
+    }
+
+    #[test]
+    fn ci_legacy_mode_429_path_is_unchanged_but_still_recorded() {
+        // 具备能力但设置为旧版:节流判据仍走 rate_limit_pace_*(这里为 0 → 排队号也冷却),
+        // 同时照常记 last_429_at 与池级 429 率。
+        let s = ci_sched_with(vec![qacct("q", 1)], |c| c.scheduler_algorithm = SchedulerAlgorithm::Affinity);
+        s.report_failure("q", UpstreamErrorKind::RateLimited);
+        let e = s.entries.lock();
+        assert!(e["q"].disabled, "旧版且 rate_limit_pace_ms=0:冷却");
+        assert!(e["q"].last_429_at.is_some());
+    }
+
+    #[test]
+    fn ci_cooling_warm_account_is_waitable_not_permanently_abandoned() {
+        let s = ci_sched_with(vec![acct("a", 1, None), acct("b", 1, None)], |c| c.rate_limit_cooldown_secs = 2);
+        {
+            let now = Instant::now();
+            s.ci.lock().touch("t1", "a", now, None, now);
+        }
+        s.report_failure("a", UpstreamErrorKind::RateLimited);
+        // 冷却 2 秒 + 429 风险:超大上下文值得等原号。
+        assert!(matches!(ci_pick(&s, &hints("t1", 5_000_000), false), CiPick::Wait(_, _)));
+        // 普通上下文去冷号,但原号仍热 —— 冷却结束后该线程还能回去。
+        match ci_pick(&s, &hints("t1", 50_000), false) {
+            CiPick::Lease(l) => assert_eq!(l.account_id(), "b"),
+            _ => panic!("应去冷号"),
+        }
+        assert!(s.ci.lock().is_warm("t1", "a", Instant::now(), Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn ci_start_spacing_applies_to_personal_only() {
+        let s = ci_sched_with(vec![acct("p", 4, None)], |c| c.cost_index_start_spacing_ms = 1000);
+        drop(s.try_lease("p").unwrap());
+        assert!(matches!(ci_pick(&s, &hints("t", 10_000), false), CiPick::Wait(_, _)), "个人号刚起跑过,要隔开");
+        let s = ci_sched_with(vec![acct("ent-1", 4, None)], |c| c.cost_index_start_spacing_ms = 1000);
+        drop(s.try_lease("ent-1").unwrap());
+        assert!(matches!(ci_pick(&s, &hints("t", 10_000), false), CiPick::Lease(_)), "企业号不受起跑间隔约束");
+    }
+
+    #[test]
+    fn ci_immediate_only_and_empty_pool() {
+        let s = ci_sched(vec![acct("a", 1, None)]);
+        let _held = s.try_lease("a").unwrap();
+        assert!(matches!(ci_pick(&s, &hints("t", 1), true), CiPick::Exhausted));
+        let empty = ci_sched(vec![]);
+        assert!(matches!(ci_pick(&empty, &hints("t", 1), false), CiPick::Exhausted));
+    }
+
+    #[test]
+    fn ci_rpm_reservation_and_probation_hold() {
+        // RPM=1:第一次领号即预留名额;第二次只能等窗口,绝不越限。
+        let s = ci_sched(vec![racct("r", 4, 100, 1)]);
+        let CiPick::Lease(l) = ci_pick(&s, &hints("t", 1), false) else { panic!("第一次应领到") };
+        drop(l);
+        assert!(matches!(ci_pick(&s, &hints("t", 1), false), CiPick::Wait(_, _)));
+        assert_eq!(s.entries.lock().get_mut("r").unwrap().rpm_used(Instant::now()), 1);
+        // 复活观察期:已有在途就不是候选(单飞)。
+        let s = ci_sched(vec![acct("a", 4, None)]);
+        s.entries.lock().get_mut("a").unwrap().probation = true;
+        let l = s.try_lease("a").unwrap();
+        assert!(matches!(ci_pick(&s, &hints("t", 1), false), CiPick::Exhausted));
+        drop(l);
+        assert!(matches!(ci_pick(&s, &hints("t", 1), false), CiPick::Lease(_)));
+    }
+
+    #[test]
+    fn ci_draining_accounts_do_not_take_new_threads_but_keep_warm_ones() {
+        let s = ci_sched(vec![acct("a", 2, None), acct("b", 2, None)]);
+        s.entries.lock().get_mut("a").unwrap().drain_until = Some(Instant::now() + Duration::from_secs(60));
+        for _ in 0..3 {
+            let CiPick::Lease(l) = ci_pick(&s, &hints("new", 1), false) else { panic!() };
+            assert_eq!(l.account_id(), "b", "新线程不进 draining 号");
+        }
+        {
+            let now = Instant::now();
+            s.ci.lock().touch("old", "a", now, None, now);
+        }
+        let CiPick::Lease(l) = ci_pick(&s, &hints("old", 200_000), false) else { panic!() };
+        assert_eq!(l.account_id(), "a", "已热的线程可以留在 draining 号上");
+    }
+
+    /// 代码评审:过了 TTL 的老家若正在 draining,按陌生号对待,不把老线程拉回去;
+    /// 全池都在 draining 时照旧 fail-open。
+    #[test]
+    fn ci_stale_home_that_is_draining_is_treated_as_cold() {
+        let s = ci_sched(vec![acct("a", 2, None), acct("b", 2, None)]);
+        {
+            let now = Instant::now();
+            s.ci.lock().touch("old", "a", now, None, now);
+            s.ci.lock().age_for_test(Duration::from_secs(400));
+        }
+        s.entries.lock().get_mut("a").unwrap().drain_until = Some(Instant::now() + Duration::from_secs(600));
+        let CiPick::Lease(l) = ci_pick(&s, &hints("old", 200_000), false) else { panic!() };
+        assert_eq!(l.account_id(), "b", "过了 TTL 的老家在软冷却,不该再拉回去");
+        drop(l);
+        let solo = ci_sched(vec![acct("a", 2, None)]);
+        {
+            let now = Instant::now();
+            solo.ci.lock().touch("old", "a", now, None, now);
+            solo.ci.lock().age_for_test(Duration::from_secs(400));
+        }
+        solo.entries.lock().get_mut("a").unwrap().drain_until = Some(Instant::now() + Duration::from_secs(600));
+        assert!(matches!(ci_pick(&solo, &hints("old", 200_000), false), CiPick::Lease(_)), "全池 draining 仍 fail-open");
+    }
+
+    #[tokio::test]
+    async fn ci_failed_attempt_is_not_warm_and_inflight_released() {
+        let s = ci_sched(vec![acct("a", 2, None)]);
+        let l = s.acquire_with_hints(None, &hints("t", 1), |_| true, None, true, None).await.unwrap();
+        assert_eq!(s.entries.lock()["a"].inflight.lock().len(), 1);
+        drop(l); // 未调用 note_thread_usage = 失败/429,不记热
+        assert!(!s.ci.lock().is_warm("t", "a", Instant::now(), Duration::from_secs(300)));
+        assert_eq!(s.entries.lock()["a"].inflight.lock().len(), 0, "lease Drop 注销在途");
+    }
+
+    #[tokio::test]
+    async fn ci_cancelled_waiter_releases_its_slot() {
+        let s = Arc::new(ci_sched(vec![acct("a", 1, None)]));
+        let _held = s.try_lease("a").unwrap();
+        {
+            let now = Instant::now();
+            s.ci.lock().touch("t", "a", now, None, now);
+        }
+        let s2 = s.clone();
+        let fut = async move {
+            s2.acquire_with_hints(None, &hints("t", 5_000_000), |_| true, None, true, None).await
+        };
+        let _ = tokio::time::timeout(Duration::from_millis(150), fut).await; // 被取消
+        assert_eq!(
+            s.entries.lock()["a"].ci_waiters.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "取号 future 被取消后等待者名额必须归还"
+        );
+    }
+
+    #[tokio::test]
+    async fn ci_warm_table_is_swept_even_in_affinity_mode() {
+        // 回归(代码评审 [严重]):旧版模式下 select_ci 不跑,热度表若只在那里清扫就会无界增长。
+        let s = ci_sched_with(vec![acct("a", 4, None)], |c| c.scheduler_algorithm = SchedulerAlgorithm::Affinity);
+        let l = s.acquire_with_hints(None, &hints("old", 1), |_| true, None, true, None).await.unwrap();
+        s.note_thread_usage(&l, None, true);
+        drop(l);
+        assert_eq!(s.queue_stats().ci_threads, 1);
+        // 把时钟「拨过」记忆时长(6 个 TTL)与清扫间隔:这条线程已被遗忘。
+        s.ci.lock().age_for_test(Duration::from_secs(2000));
+        let l = s.acquire_with_hints(None, &hints("new", 1), |_| true, None, true, None).await.unwrap();
+        s.note_thread_usage(&l, None, true);
+        assert_eq!(s.queue_stats().ci_threads, 1, "冷透的线程应在回写时被清掉,只剩新线程");
+    }
+
+    #[tokio::test]
+    async fn ci_affinity_mode_still_maintains_warm_table() {
+        let s = ci_sched_with(vec![acct("a", 1, None)], |c| c.scheduler_algorithm = SchedulerAlgorithm::Affinity);
+        let l = s.acquire_with_hints(Some("sess"), &hints("t", 1), |_| true, None, true, None).await.unwrap();
+        assert_eq!(l.pin_key.as_deref(), Some("t"), "旧版路径也带上钉号键");
+        s.note_thread_usage(&l, Some(1234), true);
+        assert!(s.ci.lock().is_warm("t", "a", Instant::now(), Duration::from_secs(300)));
+        assert_eq!(s.queue_stats().ci_decisions, 0, "旧版模式不走代价指数决策");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ci_concurrent_stress_has_no_deadlock() {
+        let s = Arc::new(ci_sched(vec![
+            qacct("q1", 2),
+            acct("p1", 2, None),
+            acct("p2", 2, Some(100)),
+            acct("ent-1", 4, None),
+        ]));
+        let mut tasks = Vec::new();
+        for i in 0..64u64 {
+            let s = s.clone();
+            tasks.push(tokio::spawn(async move {
+                let pin = format!("t{}", i % 7);
+                let h = PickHints {
+                    pin_key: Some(&pin),
+                    input_tokens_est: (i % 5) * 100_000,
+                    ci_wait_deadline: Some(Instant::now() + Duration::from_millis(300)),
+                };
+                if let Ok(l) = s
+                    .acquire_with_hints(None, &h, |_| true, None, true, Some(Instant::now() + Duration::from_secs(3)))
+                    .await
+                {
+                    tokio::time::sleep(Duration::from_millis(i % 13)).await;
+                    if i % 6 == 0 {
+                        s.report_failure_with_gen(l.account_id(), UpstreamErrorKind::RateLimited, l.suspend_gen);
+                    } else {
+                        s.report_success(l.account_id());
+                        s.note_thread_usage(&l, Some(i * 1000), true);
+                    }
+                    let _ = s.queue_stats();
+                }
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(20), async {
+            for t in tasks {
+                t.await.unwrap();
+            }
+        })
+        .await
+        .expect("并发压测不得死锁");
+        for e in s.entries.lock().values() {
+            assert_eq!(e.inflight.lock().len(), 0);
+            assert_eq!(e.ci_waiters.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
     }
 }

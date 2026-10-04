@@ -244,6 +244,46 @@ fn kiro_idp(account: &Account) -> Option<&str> {
     account.extra_str("kiro_provider").map(str::trim).filter(|v| !v.is_empty())
 }
 
+/// 调度计价档位:该号的积分是否按**企业号**(贵)计价。供最优控制调度器的号型单价使用,
+/// 不影响任何上游请求。
+///
+/// 判定顺序(先中先得):
+/// 1. `extra.price_class` 显式指定 `enterprise` / `personal`(运维手动覆盖);
+/// 2. ksk_ API Key 凭据(补货买的贵号池)→ 企业;
+/// 3. `auth_method = external_idp`(Azure AD 企业 SSO)→ 企业;
+/// 4. `kiro_provider ∈ {enterprise, internal}` → 企业;
+/// 5. `kiro_provider ∈ {builderid, builder-id, aws, github, google}` → 个人 ——
+///    **必须排在 IdC 判定之前**:付费 BuilderID 号同样带 client_id + client_secret,
+///    只按 IdC 判会把它们误算成企业号;
+/// 6. 其余只要带 IdC 材料(client_id + client_secret)→ 企业;
+/// 7. 默认个人。
+pub fn is_enterprise_priced(account: &Account) -> bool {
+    if let Some(v) = account.extra_str("price_class").map(str::trim) {
+        if v.eq_ignore_ascii_case("enterprise") {
+            return true;
+        }
+        if v.eq_ignore_ascii_case("personal") {
+            return false;
+        }
+    }
+    if crate::machine_id::is_api_key_credential(account) || is_external_idp(account) {
+        return true;
+    }
+    if let Some(idp) = kiro_idp(account) {
+        if idp.eq_ignore_ascii_case("enterprise") || idp.eq_ignore_ascii_case("internal") {
+            return true;
+        }
+        if ["builderid", "builder-id", "aws", "github", "google"]
+            .iter()
+            .any(|p| idp.eq_ignore_ascii_case(p))
+        {
+            return false;
+        }
+    }
+    account.extra_str("client_id").is_some_and(|s| !s.is_empty())
+        && account.extra_str("client_secret").is_some_and(|s| !s.is_empty())
+}
+
 /// 条件头判定:Kiro idp == "internal"(大小写不敏感)。
 fn is_internal_provider(account: &Account) -> bool {
     kiro_idp(account).is_some_and(|v| v.eq_ignore_ascii_case("internal"))
@@ -321,6 +361,30 @@ pub(crate) fn apply_idc_refresh_headers(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn enterprise_pricing_classification() {
+        // 生产 09-30 实际形态:企业号 = kiro_provider enterprise + IdC 材料。
+        assert!(is_enterprise_priced(&account_with(json!({
+            "kiro_provider": "enterprise", "auth_method": "IdC",
+            "client_id": "cid", "client_secret": "sec"}))));
+        // 付费 BuilderID 同样带 client_id+secret,但属个人号(判定必须先看 kiro_provider)。
+        assert!(!is_enterprise_priced(&account_with(json!({
+            "kiro_provider": "builderid", "client_id": "cid", "client_secret": "sec"}))));
+        // 社交号。
+        assert!(!is_enterprise_priced(&account_with(json!({"kiro_provider": "google", "auth_method": "social"}))));
+        assert!(!is_enterprise_priced(&account_with(json!({"kiro_provider": "github"}))));
+        // ksk_ API Key(补货贵号池)、external_idp、internal → 企业。
+        assert!(is_enterprise_priced(&account_with(json!({"kiro_api_key": "ksk_abc", "auth_method": "api_key"}))));
+        assert!(is_enterprise_priced(&account_with(json!({"auth_method": "external_idp"}))));
+        assert!(is_enterprise_priced(&account_with(json!({"kiro_provider": "internal"}))));
+        // 无 kiro_provider 的裸 IdC → 企业;什么都没有 → 个人。
+        assert!(is_enterprise_priced(&account_with(json!({"client_id": "c", "client_secret": "s"}))));
+        assert!(!is_enterprise_priced(&account_with(json!({}))));
+        // 显式覆盖优先。
+        assert!(!is_enterprise_priced(&account_with(json!({"price_class": "personal", "kiro_provider": "enterprise"}))));
+        assert!(is_enterprise_priced(&account_with(json!({"price_class": "Enterprise", "kiro_provider": "google"}))));
+    }
 
     fn account_with(extra: serde_json::Value) -> Account {
         let mut acc = Account {

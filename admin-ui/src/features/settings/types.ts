@@ -78,6 +78,40 @@ export interface SystemSettings {
   warmup_phase2_rpm?: number
   /** 按分组的新号暖机策略：命中的组完全接管（单期；hours=0 = 该组关闭暖机），未列出的组走全局两期。 */
   warmup_group_policies?: Record<string, GroupWarmupPolicy> | null
+  /** 账号调度算法（默认 cost_index；仅 kiro worker 生效）。旧版本后端不返回。 */
+  scheduler_algorithm?: SchedulerAlgorithm
+  /** 代价指数：等待代价 κ（积分/秒，默认 1.0）。 */
+  cost_index_kappa?: number
+  /** 代价指数：429 风险价 η（积分/次，默认 3.0）。 */
+  cost_index_eta?: number
+  /** 代价指数：个人号两次起跑的最小间隔（毫秒，默认 1000；0 = 不限）。 */
+  cost_index_start_spacing_ms?: number
+  /** 代价指数：排队号撞 429 后的节流时长（毫秒，默认 1000）。 */
+  cost_index_pace_ms?: number
+  /** 代价指数：连续 429 超过该次数退回普通冷却（默认 3；0 = 永不退回）。 */
+  cost_index_pace_max_strikes?: number
+  /** 代价指数：个人号 429 也走短节流（实验，默认关）。 */
+  cost_index_pace_personal?: boolean
+  /** 代价指数：单请求为等热号的最长等待（毫秒，默认 30000）。 */
+  cost_index_max_wait_ms?: number
+  /** 代价指数：企业号每积分成本相对个人号的倍数（默认 3.0）。 */
+  cost_index_enterprise_price?: number
+  /** 代价指数：同一线程在同一号上算「热」的时长（秒，默认 300）。 */
+  cost_index_cache_ttl_secs?: number
+  /** 亲和调度：钉住的主号并发满时，溢出前的等待（毫秒，默认 0）。 */
+  affinity_hold_ms?: number
+  /** 高优先层有空位时把会话迁回去（默认开；两种算法共用）。 */
+  affinity_migrate_up?: boolean
+  /** 亲和调度：全组冷却时排队等待上限（毫秒，默认 0）。 */
+  queue_wait_ms?: number
+  /** 亲和调度：降层前为高优先层等待的上限（毫秒，默认 0）。 */
+  tier_hold_ms?: number
+  /** 亲和调度：允许降层前等待的请求级窗口（毫秒，默认 0）。 */
+  tier_hold_window_ms?: number
+  /** 亲和调度：排队号撞 429 后的节流（毫秒，默认 0 = 走普通冷却）。 */
+  rate_limit_pace_ms?: number
+  /** 亲和调度：节流熔断次数（默认 0 = 永不退回）。 */
+  rate_limit_pace_max_strikes?: number
   /**
    * 逐 worker 的**实然值**：该 worker 此刻真正在用的热调参数 + 最近一次同步的结果。
    *
@@ -127,6 +161,11 @@ export interface WorkerSettingsView {
 export const THINKING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
 
 export type ThinkingEffort = (typeof THINKING_EFFORTS)[number]
+
+/** 账号调度算法全集。与后端 `scheduler_algorithm` 取值一致。 */
+export const SCHEDULER_ALGORITHMS = ['cost_index', 'affinity'] as const
+
+export type SchedulerAlgorithm = (typeof SCHEDULER_ALGORITHMS)[number]
 
 /** 一个分组的新号暖机策略（与后端 `GroupWarmupPolicy` 对齐）。 */
 export interface GroupWarmupPolicy {

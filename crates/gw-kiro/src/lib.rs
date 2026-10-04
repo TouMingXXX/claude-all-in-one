@@ -299,6 +299,11 @@ impl Provider for KiroProvider {
         converter::affinity_key_from_body(&req.body)
     }
 
+    /// 调度钉号键(会话 + 线程),见 [`converter::thread_key_from_body`]。
+    fn thread_key(&self, req: &ChatRequest) -> Option<String> {
+        converter::thread_key_from_body(&req.body)
+    }
+
     async fn refresh_auth(&self, account: &Account) -> Result<Account, UpstreamError> {
         // API Key 凭据:长期有效、无 OIDC 刷新概念,原样返回(ksk_ 就是 bearer)。
         // 常态下不会走到这里(has_fresh_token 对 apikey 恒真);仅当 chat 收 403 走同号

@@ -25,6 +25,23 @@ const LABELS: Record<string, string> = {
   rate_limit_cooldown_secs: '限流冷却',
   suspended_cooldown_secs: '封禁冷却',
   affinity_ttl_secs: '会话亲和 TTL',
+  scheduler_algorithm: '调度算法',
+  cost_index_kappa: '等待代价 κ',
+  cost_index_eta: '429 风险价 η',
+  cost_index_start_spacing_ms: '个人号起跑间隔',
+  cost_index_pace_ms: '429 节流时长（代价指数）',
+  cost_index_pace_max_strikes: '节流熔断次数（代价指数）',
+  cost_index_pace_personal: '个人号 429 短节流',
+  cost_index_max_wait_ms: '最长等待',
+  cost_index_enterprise_price: '企业号积分相对单价',
+  cost_index_cache_ttl_secs: '缓存有效期',
+  affinity_hold_ms: '主号忙时等待',
+  affinity_migrate_up: '自动迁回高优先层',
+  queue_wait_ms: '排队等冷却',
+  tier_hold_ms: '降层前等待',
+  tier_hold_window_ms: '降层等待窗口',
+  rate_limit_pace_ms: '429 节流（亲和）',
+  rate_limit_pace_max_strikes: '节流熔断次数（亲和）',
 }
 
 /** 浮点比较：JSON 往返后 0.9 可能变成 0.9000000000000001。 */

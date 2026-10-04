@@ -50,6 +50,23 @@ scheduler:
   #    社交号的 429 常伴额度见底,等待只是把客户多挂几秒后照样报错。
   #    ⚠️ 新导入的企业号要手动开,导入接口不带这个字段。
 
+  # ── 选号算法(2026-09-30 加)────────────────────────────────────────────
+  # cost_index = 最优控制调度器(默认):每次选号估「积分(冷/热)+ κ·等待 + 429 风险」取最小,
+  #   钉号粒度到「会话 + 线程」;只在 kiro worker 生效(cursor/dario 恒走旧版)。
+  # affinity   = 旧版亲和 + 溢出,行为与引入本开关前一致。
+  # 依据:caio-sched-sim/report(历史高峰回放省约 15% 积分,等待 p95 约 1–1.5s)。
+  # 单个 worker 急停:环境变量 KIRO_COST_INDEX=0(重启该 worker 生效)。
+  scheduler_algorithm: cost_index   # [热调] cost_index / affinity
+  cost_index_kappa: 1.0             # [热调] 等待代价(积分/秒)。越小越愿意等热号
+  cost_index_eta: 3.0               # [热调] 每次 429 的风险成本(积分)
+  cost_index_start_spacing_ms: 1000 # [热调] 个人号两次起跑的最小间隔,0=不限
+  cost_index_pace_ms: 1000          # [热调] 个人号 429 节流时长(仅 cost_index_pace_personal=true 时生效;排队号始终按 rate_limit_pace_*)
+  cost_index_pace_max_strikes: 3    # [热调] 个人号节流熔断:连续 429 超过此数退回普通冷却,0=永不(排队号不看这里)
+  cost_index_pace_personal: false   # [热调] 个人号 429 也短节流(实验;默认照旧冷却但不再永久改钉)
+  cost_index_max_wait_ms: 30000     # [热调] 单请求为等热号最多等多久(从请求开始算)
+  cost_index_enterprise_price: 3.0  # [热调] 企业号每积分相对个人号的倍数
+  cost_index_cache_ttl_secs: 300    # [热调] 上游缓存有效期。热度曲线按它等比伸缩,线程在哪些号上跑过记 6 倍长(默认 30 分钟)
+
 # 思考档位。
 thinking:
   default_effort: high   # [热调] 客户端没指定时的默认档位。生产实际值:high(曾试过 max)
