@@ -363,7 +363,7 @@ pub fn convert_request(
         text_content
     };
 
-    // 12.1 安全分类器第二段「正文写 <thinking>」指令的上游兼容改写(仅 opus-5.5,逐字匹配
+    // 12.1 安全分类器第二段「正文写 <thinking>」指令的上游兼容改写(按模型表,目前 5.5 系,逐字匹配
     // Claude Code 原句;不命中零改动)。上游把它判成 REASONING_EXTRACTION 拒答,见
     // classifier_prompt 模块注释。在 thinking 前缀注入之前做,只动当前轮文本。
     let content = classifier_prompt::rewrite_visible_thinking_directive(&req.model, content);

@@ -51,6 +51,7 @@ pub struct KiroModel {
     /// 2026-09-29 真号 A/B(同一账号、同一道题,max 档):opus-5.5 结构化字段 → 签名 35~41k、
     /// 输出 ~3000 token、~145s,low→xhigh→max 严格单调;旧标签 → 5~15k、~450 token,与 low 无差。
     /// opus-5 / 4.8 旧标签照常生效(max 档 5~14k 字符思考、93~243s),保持 false 不动线缆。
+    /// 2026-10-03 sonnet-5.5 同 opus-5.5(旧标签不分档,结构化严格分档)→ true。
     pub structured_effort_only: bool,
     /// 上游会把「在正文里写 `<thinking>`」的指令判成 `REASONING_EXTRACTION` 拒答
     /// (`metadataEvent.stopDetails.refusal`,零产出)。为 true 时,转换器把 Claude Code
@@ -59,7 +60,7 @@ pub struct KiroModel {
     ///
     /// 2026-09-29 真号直放实测(opus-5.5,同一报文):原样 → 拒答;去掉结构化 effort 仍拒答
     /// (与 effort 字段无关);改写后两条样本都正常出 `<block>`,模型走原生推理(约 800 字符)。
-    /// sonnet-5 同一类请求 11/11 正常,保持 false 不动。
+    /// sonnet-5 同一类请求 11/11 正常,保持 false 不动。2026-10-03 sonnet-5.5 原句同样被拒 → true。
     pub rewrite_visible_thinking_directive: bool,
 }
 
@@ -73,7 +74,7 @@ pub struct KiroModel {
 /// |---|---|---|---|
 /// | 旧 | 无 | 有 | opus-4.8 |
 /// | v2 | 2 | 有 | opus-5 |
-/// | v4 | 4 | **无**(f5 也无) | opus-5.5 |
+/// | v4 | 4 | **无**(f5 也无) | opus-5.5、sonnet-5.5 |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignatureId {
     /// 无原生签名推理(无 reasoningContentEvent 签名帧,或 inline `<thinking>` 文本形态)。
@@ -85,6 +86,10 @@ pub enum SignatureId {
     /// 信封**不带**模型代号,只能按信封版本匹配:顶层 f1 == `envelope_version` 且确无 f6
     /// 才上传。跨模型误挂(另一个同版本信封的模型签发)无法在本地识别,由上游验签兜底
     /// (`THINKING_SIGNATURE_INVALID` → 剥全历史 reasoning 重试一次,见 chat.rs)。
+    ///
+    /// 2026-10-03 实测这不是假设:opus-5.5 与 sonnet-5.5 都是 v4,且签名明文头逐字段相同
+    /// (f1=18 / f2=1 / f3=2 / f7=1 / f8=`thinking`,顶层 f3=1),同一会话中途换模型时
+    /// 会把对方签发的推理一并回传。
     Anonymous { envelope_version: u64 },
 }
 
@@ -206,6 +211,28 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         signature_id: SignatureId::Unsigned,
         structured_effort_only: false,
         rewrite_visible_thinking_directive: false,
+    },
+    KiroModel {
+        // 2026-10-03 上游目录新增(付费号实拉,第 21 个模型)。与 opus-5.5 同规律:
+        // 上游 modelId 带点号 `claude-sonnet-5.5`,对外名用连字符 `claude-sonnet-5-5`。
+        // schema:1M 入 / 128K 出(sonnet-5 是 64K 出),rateMultiplier 1.3(与 sonnet-5 同价),
+        // `output_config.effort` 5 档、default=`high`。
+        // 末三列均为 2026-10-03 真号直放实测(见 CHANGELOG [sonnet-5.5]),与 opus-5.5 完全同形:
+        // - 签名:v4 无代号信封,明文头与 opus-5.5 逐字段相同;带签名的历史推理回传 → 200 正常收尾;
+        // - 思考强度:旧标签 low/xhigh 思考量互相重叠(1.1k~4k 字符),结构化 low ≈1.1k / max ≈7~8k;
+        // - 分类器第二段原句 → REASONING_EXTRACTION 拒答,改写后正常出 <block>。
+        advertised_id: "claude-sonnet-5-5",
+        display_name: "Claude Sonnet 5.5",
+        kiro_model: "claude-sonnet-5.5",
+        identity_short: "Sonnet 5.5",
+        context_window: 1_000_000,
+        supports_thinking: true,
+        dated_alias: None,
+        effort_levels: EFFORTS_WITH_XHIGH,
+        default_effort: Some("high"),
+        signature_id: SignatureId::Anonymous { envelope_version: 4 },
+        structured_effort_only: true,
+        rewrite_visible_thinking_directive: true,
     },
     KiroModel {
         // 2026-07-02 上游 ListAvailableModels 实测新增(标注 experimental preview),
@@ -415,7 +442,16 @@ pub fn map_model(model: &str) -> Option<String> {
 fn map_model_substring(model_lower: &str) -> Option<String> {
     if model_lower.contains("sonnet") {
         // 2026-05-29: Kiro 上游尚未支持 sonnet-4.8（INVALID_MODEL_ID），未来上线再加 4-8 分支
-        if model_lower.contains("4-6") || model_lower.contains("4.6") {
+        if model_lower.contains("sonnet-5-5")
+            || model_lower.contains("sonnet-5.5")
+            || model_lower.contains("sonnet5.5")
+            || model_lower.contains("sonnet5-5")
+        {
+            // 2026-10-03: 上游新增 claude-sonnet-5.5。**必须排在 sonnet-5 分支之前** —— 否则
+            // `sonnet-5-5` 含 `sonnet-5` 邻接串,会被**静默降级**成 claude-sonnet-5
+            // (客户以为在用 5.5,实际拿到 5,且不报错)。与 opus-5.5 同一个坑。
+            Some("claude-sonnet-5.5".to_string())
+        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-sonnet-4.5".to_string())
@@ -464,7 +500,7 @@ fn map_model_substring(model_lower: &str) -> Option<String> {
     }
 }
 
-/// 根据模型名返回上下文窗口大小。权威表优先,兜底子串(1M 仅 opus-5.5/opus-5/sonnet-5/sonnet-4.6/opus-4.6/4.7/4.8)。
+/// 根据模型名返回上下文窗口大小。权威表优先,兜底子串(1M 仅 opus-5.5/opus-5/sonnet-5.5/sonnet-5/sonnet-4.6/opus-4.6/4.7/4.8)。
 pub fn get_context_window_size(model: &str) -> i32 {
     if let Some(m) = resolve_base(model) {
         return m.context_window;
@@ -473,6 +509,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
         Some(mapped)
             if mapped == "claude-opus-5.5"
                 || mapped == "claude-opus-5"
+                || mapped == "claude-sonnet-5.5"
                 || mapped == "claude-sonnet-5"
                 || mapped == "claude-sonnet-4.6"
                 || mapped == "claude-opus-4.6"
@@ -555,6 +592,8 @@ mod tests {
         let expect: &[(&str, SignatureId)] = &[
             // 2026-09-26 实测:v4 信封,无 f5/f6。
             ("claude-opus-5.5", Anonymous { envelope_version: 4 }),
+            // 2026-10-03 实测:同为 v4 信封,明文头与 opus-5.5 逐字段相同(f1=18/f2=1/f3=2/f7=1/f8)。
+            ("claude-sonnet-5.5", Anonymous { envelope_version: 4 }),
             ("claude-opus-5", Codename("claude-honey")),
             ("claude-opus-4.8", Codename("claude-quince")),
             ("claude-opus-4.7", Codename("claude-opus-4-7")), // 代号=官方名,实测如此
@@ -684,6 +723,41 @@ mod tests {
         let ids: Vec<String> = advertised_models().into_iter().map(|m| m.id).collect();
         assert!(ids.contains(&"claude-opus-5-5".to_string()));
         assert!(ids.contains(&"claude-opus-5-5-thinking".to_string()));
+    }
+
+    #[test]
+    fn sonnet_5_5_resolves_and_is_not_downgraded_to_sonnet_5() {
+        // 权威表精确匹配(plain/-thinking)→ 上游点号 id。
+        assert_eq!(map_model("claude-sonnet-5-5").as_deref(), Some("claude-sonnet-5.5"));
+        assert_eq!(map_model("claude-sonnet-5-5-thinking").as_deref(), Some("claude-sonnet-5.5"));
+        assert_eq!(resolve_base("claude-sonnet-5-5").map(|m| m.identity_short), Some("Sonnet 5.5"));
+        assert_eq!(get_context_window_size("claude-sonnet-5-5"), 1_000_000);
+        // 回归(2026-10-03 上线前发现):各种 5.5 写法都不能被 sonnet-5 分支吞成 claude-sonnet-5。
+        for alias in [
+            "claude-sonnet-5.5",
+            "Claude-Sonnet-5.5-thinking",
+            "openrouter/claude-sonnet-5-5-preview",
+            "anthropic/claude-sonnet5.5",
+            "claude-sonnet5-5",
+        ] {
+            assert_eq!(map_model(alias).as_deref(), Some("claude-sonnet-5.5"), "{alias}");
+            assert_eq!(get_context_window_size(alias), 1_000_000, "{alias}");
+        }
+        // sonnet-5 与 4.x 不受影响;历史名 claude-3-5-sonnet 仍不被任何 5.x 分支误吞。
+        assert_eq!(map_model("claude-sonnet-5").as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(map_model("openrouter/claude-sonnet-5-preview").as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(map_model("claude-sonnet-4-5").as_deref(), Some("claude-sonnet-4.5"));
+        assert_eq!(map_model("claude-sonnet-4-5-20250929").as_deref(), Some("claude-sonnet-4.5"));
+        assert_eq!(map_model("claude-sonnet-4-6").as_deref(), Some("claude-sonnet-4.6"));
+        assert_eq!(map_model("claude-3-5-sonnet").as_deref(), None);
+        // 档位表与上游 schema 一致:5 档全集,default=high。
+        assert_eq!(clamp_effort_for_model("claude-sonnet-5-5", None), Some("high"));
+        assert_eq!(clamp_effort_for_model("claude-sonnet-5-5", Some("xhigh")), Some("xhigh"));
+        assert_eq!(clamp_effort_for_model("claude-sonnet-5-5", Some("max")), Some("max"));
+        // 公告目录里有它。
+        let ids: Vec<String> = advertised_models().into_iter().map(|m| m.id).collect();
+        assert!(ids.contains(&"claude-sonnet-5-5".to_string()));
+        assert!(ids.contains(&"claude-sonnet-5-5-thinking".to_string()));
     }
 
     #[test]

@@ -105,7 +105,7 @@ pub fn render_kiro_payload(req: &ChatRequest, account: &Account) -> String {
         Ok(c) => c,
         Err(e) => return format!("<转换失败: {e}>"),
     };
-    // legacy 线缆形态:思考强度走旧文本标签(结构化字段不发;例外 opus-5.5 只认结构化字段照发),
+    // legacy 线缆形态:思考强度走旧文本标签(结构化字段不发;例外 5.5 系按模型表照发结构化字段),
     // body 顶层 agentMode 省略(0.12.155 时代没有该字段)。见 wire_profile。
     let legacy = crate::wire_profile::legacy_wire();
     let kiro_req = KiroRequest {
@@ -203,7 +203,7 @@ pub async fn chat_stream(
     let profile_arn = crate::headers::resolve_profile_arn(&account);
     // 思考强度走 1.0.212 的结构化字段(旧的正文文本标签见 converter::history 的开关)。
     // legacy 线缆形态:结构化字段与 body 顶层 agentMode 都不发(见 wire_profile);
-    // 例外:上游只认结构化思考强度的模型(opus-5.5)照发 additionalModelRequestFields。
+    // 例外:模型表 structured_effort_only 的模型(opus-5.5 / sonnet-5.5)照发 additionalModelRequestFields。
     let legacy = crate::wire_profile::legacy_wire();
     let amrf = crate::thinking_policy::wire_additional_model_request_fields(&messages_req, legacy);
     if let Some(v) = &amrf {

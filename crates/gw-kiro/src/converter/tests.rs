@@ -1628,6 +1628,32 @@ fn test_opus_5_5_rejects_foreign_envelopes_and_vice_versa() {
 }
 
 #[test]
+fn test_sonnet_5_5_v4_signature_is_uploaded_and_codenamed_ones_are_not() {
+    // 2026-10-03 真号实测:sonnet-5.5 同为 v4 无代号信封;带它的 reasoningContent 回传后上游 200 正常收尾。
+    let mut m = HashMap::new();
+    let up = |sig: &str, model: &str, m: &mut HashMap<String, String>| {
+        convert_assistant_message(&signed_asst("推理", sig, "答"), m, true, model)
+            .unwrap()
+            .assistant_response_message
+            .reasoning_content
+            .is_some()
+    };
+    let v4 = crate::signature::test_envelope(Some(4), None);
+    let saffron_v2 = crate::signature::test_envelope(Some(2), Some("claude-saffron"));
+    assert!(up(&v4, "claude-sonnet-5.5", &mut m), "sonnet-5.5 自己的 v4 签名必须上传");
+    // 会话中途在 sonnet-5 与 sonnet-5.5 之间切换:带代号的与 v4 互不挂。
+    assert!(!up(&saffron_v2, "claude-sonnet-5.5", &mut m), "sonnet-5 的签名不能挂到 5.5");
+    assert!(!up(&v4, "claude-sonnet-5", &mut m), "5.5 的 v4 签名不能挂到 sonnet-5");
+    assert!(up(&saffron_v2, "claude-sonnet-5", &mut m), "sonnet-5 自己的签名照常上传(回归)");
+    // 已知局限(写进 SignatureId::Anonymous 文档):opus-5.5 与 sonnet-5.5 的 v4 明文头逐字段相同,
+    // 本地分不出签发模型 —— 两个 5.5 之间互相会挂上,交给上游验签。这里钉住现状,改门控时必须
+    // 有意识地改这条断言。
+    assert!(up(&v4, "claude-opus-5.5", &mut m));
+    let synth = crate::signature::synthesize_signature("claude-sonnet-5-5", "推理");
+    assert!(!up(&synth, "claude-sonnet-5.5", &mut m), "合成签名不能冒充 v4");
+}
+
+#[test]
 fn test_synthesized_signature_dropped_before_upstream() {
     // 我方合成的假签名(无原生推理模型的下行兜底)→ 重推导识别后丢弃,
     // 不带上行白吃 THINKING_SIGNATURE_INVALID。
@@ -3013,10 +3039,10 @@ fn image_url_data_urls_become_images_remote_urls_skipped() {
     assert_eq!(got, vec![("png", "iVBORw0K"), ("jpeg", "/9j/4AAQ")], "按块顺序;远程 URL 与 bmp 跳过");
 }
 
-/// 安全分类器第二段「正文写 <thinking>」指令:opus-5.5 在转换时被改写,其余模型原样;
+/// 安全分类器第二段「正文写 <thinking>」指令:opus-5.5 / sonnet-5.5 在转换时被改写,其余模型原样;
 /// 改写只作用于当前轮文本(2026-09-29,上游 REASONING_EXTRACTION 拒答修复)。
 #[test]
-fn convert_request_rewrites_stage2_thinking_directive_for_opus_5_5_only() {
+fn convert_request_rewrites_stage2_thinking_directive_for_5_5_models_only() {
     use crate::anthropic_types::Message as AnthropicMessage;
     let tail = "Review the classification process and follow it carefully. Use <thinking> before responding with <block>. Think longer on ambiguous or borderline actions; keep reasoning brief for clear-cut ones.";
     let build = |model: &str| MessagesRequest {
@@ -3052,6 +3078,9 @@ fn convert_request_rewrites_stage2_thinking_directive_for_opus_5_5_only() {
     assert!(!c.contains("Use <thinking>"), "opus-5.5 必须改写: {c}");
     assert!(c.contains("Think it through before responding with <block>."), "{c}");
     assert!(c.contains("{\"Bash\":\"ls\"}") && c.contains("keep reasoning brief"), "其余内容保留: {c}");
+    // 2026-10-03 真号直放:sonnet-5.5 原句同样被判 REASONING_EXTRACTION,改写后正常出 <block>。
+    let c = content("claude-sonnet-5-5");
+    assert!(c.contains("Think it through before responding with <block>."), "sonnet-5.5 必须改写: {c}");
     let c = content("claude-sonnet-5");
     assert!(c.contains("Use <thinking> before responding with <block>."), "sonnet-5 不动: {c}");
 }

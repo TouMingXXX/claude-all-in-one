@@ -1,5 +1,64 @@
 # Changelog
 
+## [sonnet-5.5] - 2026-10-03
+
+### 新增:接入 claude-sonnet-5.5
+- 上游 `ListAvailableModels` 新增 `claude-sonnet-5.5`(10-03 用一个付费号拉取,目录变成 21 个模型):
+  1M 输入 / 128K 输出(sonnet-5 是 64K)、rateMultiplier 1.3(与 sonnet-5 同价,opus-5.5 是 2.0)、
+  `output_config.effort` 5 档、默认 `high`。
+- 权威模型表新增 `claude-sonnet-5-5`(上游 `claude-sonnet-5.5`),`/v1/models` 自动带上 plain 与 `-thinking`
+  两个名字。
+- 修复静默降级:此前子串兜底会把 `claude-sonnet-5-5` / `5.5` 写法当成 `claude-sonnet-5` 发上游,不报错,
+  客户以为在用 5.5。现在 5.5 分支排在 sonnet-5 之前,和 09-26 opus-5.5 的修法一样。上线前 3 天没有客户端
+  请求过这个名字,没有已发生的影响。
+
+### 真号直放实测(决定模型表末三列)
+- 方法:用新代码的 `render_kiro_payload` 离线生成报文;在 139 上用 python 直放上游,每个号走它自己的 proxy,
+  顺序发送、不并发。共约 15 次请求(含 1 次撞上该号 429),花费约 8 积分。
+- **签名**:v4 无代号信封(顶层 f1=4、f3=1;明文头 f1=18 / f2=1 / f3=2 / f7=1 / f8=`thinking`,无 f5 / f6),
+  与生产日志里 opus-5.5 的签名明文头**逐字段相同** → `SignatureId::Anonymous { envelope_version: 4 }`。
+  第 2 轮带上第 1 轮的 reasoningContent 和签名回传,上游 200、正常 END_TURN。
+- **思考强度**(5×5 行列式题,两轮全部答对 276364):
+
+  | 条件 | 思考字符数 | 耗时 |
+  |---|---|---|
+  | 结构化 low(+旧标签,生产形态) | 1069 / 1172 | 16–17s |
+  | 结构化 max(+旧标签 xhigh) | 8038 / 7224 | 79s |
+  | 只有旧标签 low | 1151 / 4005 | 21 / 46s |
+  | 只有旧标签 xhigh | 3923 / 2541 | 50 / 29s |
+
+  只有旧标签时 low 与 xhigh 的思考量互相重叠,等于不分档;结构化字段严格分档 →
+  `structured_effort_only = true`。legacy 线缆下照发 `additionalModelRequestFields`,与 opus-5.5 相同。
+- **自动模式分类器第二段**:用 Claude Code 2.1.284 原版 system 提示,配一段编造的危险命令转录(不用客户数据)。
+  原句 `Use <thinking> before responding with <block>.` 用时 2.8s,被判 `REASONING_EXTRACTION`,零产出;
+  改写为 `Think it through …` 后用时 6.7s,正常给出 `<block>yes</block><category>Irreversible Local Destruction</category>…`
+  → `rewrite_visible_thinking_directive = true`。
+
+### Design Rationale
+- 三列全部按实测填写,没有照抄 opus-5.5。sonnet-5 和 opus-5.5 在这三项上的行为恰好相反,不能凭家族名猜。
+- 已知局限:两个 5.5 模型的 v4 签名明文头完全相同,本地分不出是哪个模型签发的。同一会话中途在两者之间切换时,
+  会把对方签发的推理一起回传,只能交给上游验签兜底:上游静默丢弃,或报 `THINKING_SIGNATURE_INVALID` 后
+  caio 剥掉推理重试。这条路径很少见,不为它另造机制;测试里钉住了这个现状。
+
+### Notes & Caveats
+- sonnet 不像 Opus 那样默认开思考:请求不带 `thinking` 时不发强度字段。这是既有策略,与 sonnet-5 一致;
+  Claude Code 会显式带 `thinking`。
+- 只需重建 kiro 的 worker0。router 的 `/v1/models` 是转发给 worker 的,不用动。
+  回滚:compose 把 worker0 改回 `cost-index-fix1-20260930`。
+- 测试:后端 1880 个全过(1877 → 1880)。新增 3 个用例:映射与防降级、v4 签名回传门控、分类器改写;
+  另扩充了 3 个已有用例:结构化强度、`/v1/models`、`convert_request` 改写。
+- **上线**:2026-10-03 09:37:22 UTC,镜像 `claude-all-in-one:sonnet55-20261003`,只重建了 worker0
+  (compose 备份 `docker-compose.yml.bak-sonnet55-20261003-093711`)。router、cursor 未动。
+- **上线后全链路验证**:test key 临时启用,验证完已禁用。
+  - 多轮对话:第 2 轮发往上游的 history 里,assistant 消息带 `reasoningContent`,签名与推理文本和第 1 轮
+    下发给客户端的**逐字节一致**。
+  - 工具循环(先思考再 tool_use,再回 tool_result):同一条 history assistant 消息同时带 `toolUses` 和
+    `reasoningContent`,签名同样逐字节一致,上游正常 end_turn。
+  - 上游 `modelId=claude-sonnet-5.5`,`additionalModelRequestFields.output_config.effort` 按请求下发。
+- 重启副作用:8 个企业号(IdC)的凭证已失效(刷新报 `invalid_grant Resource not found`),但仍在配置中启用、
+  优先级 1。重启后它们被优先挨个尝试,各失败 3 次才被禁用。09:38–09:39 两分钟首包平均 8–11s、最长 64s,
+  没有失败请求。
+
 ## [kiro-media-count] - 2026-09-29
 
 ### 修复:单请求图片/文档总数超 100 让长会话每轮 400

@@ -575,6 +575,15 @@ mod tests {
         assert_eq!(opus48.context_length, Some(1_000_000));
         let sonnet45 = models.iter().find(|m| m.id == "claude-sonnet-4-5").unwrap();
         assert_eq!(sonnet45.context_length, Some(200_000));
+        // 2026-10-03 上游新增 sonnet-5.5:公告、1M 窗口、thinking 变体齐全。
+        for id in ["claude-sonnet-5-5", "claude-sonnet-5-5-thinking"] {
+            let m = models
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("目录缺少 {id}"));
+            assert_eq!(m.context_length, Some(1_000_000), "{id}");
+            assert!(m.supports_tools && m.supports_vision, "{id} 工具/视觉能力缺失");
+        }
         // 新:thinking 变体与日期快照名也要公告(NewAPI 渠道按这些名拉取)。
         for id in [
             "claude-opus-4-8-thinking",

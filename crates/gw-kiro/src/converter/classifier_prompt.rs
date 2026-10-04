@@ -26,8 +26,10 @@
 //!   逐字相同的句子;没有 `</transcript>` 的请求不是分类器请求,一个字节不动。转录里引用到
 //!   这句话(例如用户正在讨论这个问题)也不动 —— 那是被审查的内容,改了会改变分类器看到的事实。
 //!   第二段是单轮请求,改写落在报文尾部,不影响缓存前缀。
-//! - 只对模型表 `rewrite_visible_thinking_directive=true` 的模型生效(目前仅 opus-5.5);
-//!   sonnet-5 同类请求 11/11 正常,不动。
+//! - 只对模型表 `rewrite_visible_thinking_directive=true` 的模型生效(opus-5.5、sonnet-5.5);
+//!   sonnet-5 同类请求 11/11 正常,不动。sonnet-5.5(2026-10-03 真号直放,合成的第二段请求):
+//!   原句 2.8s 判 `REASONING_EXTRACTION` 零产出;改写后 6.7s 正常出
+//!   `<block>yes</block><category>Irreversible Local Destruction</category>…`,原生推理约 580 字符。
 //! - `<severity>` 版本(`Use <thinking> first, then respond with <severity>N</severity>`)
 //!   与 `<block>` 版本同一机制,一并改写;该版本未单独真号实测。
 
@@ -115,6 +117,16 @@ mod tests {
     fn no_transcript_marker_means_not_a_classifier_request() {
         let input = STAGE2_TAIL.to_string();
         assert_eq!(rewrite_visible_thinking_directive("claude-opus-5-5", input.clone()), input);
+    }
+
+    #[test]
+    fn sonnet_5_5_stage2_directive_is_rewritten() {
+        let input = format!("<transcript>\n...\n</transcript>\n{STAGE2_TAIL}");
+        for model in ["claude-sonnet-5-5", "claude-sonnet-5.5", "claude-sonnet-5-5-thinking"] {
+            let out = rewrite_visible_thinking_directive(model, input.clone());
+            assert!(out.contains("Think it through before responding with <block>."), "{model}");
+            assert!(!out.contains("Use <thinking>"), "{model}");
+        }
     }
 
     #[test]
